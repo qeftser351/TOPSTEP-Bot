@@ -1,0 +1,125 @@
+# core/entry_logic.py
+from typing import List, Optional, Dict
+
+# Kerzen und Phasen kommen aus core.types, nicht config.phase
+from core.types      import Candle, Phase
+from core.phase_manager import PhaseStateMachine
+from config.phase   import is_confirmation_bullish, is_confirmation_bearish
+from config.phase import EMA_FAST_PERIOD, EMA_SLOW_PERIOD, EMA_SOURCE, _ema
+import pandas as pd
+
+# Fallback für Mindestabstand, falls Broker keine trade_stops_level liefert
+default_stop_level_points = 10
+
+class ConfigEntryLogic:
+    def __init__(self, phase_machine: PhaseStateMachine, spread: float):
+        self.pm = phase_machine
+        self.spread = spread
+        # Standard-Minimum in Punkten bei fehlendem stop_level
+        self.default_stop_level_points = default_stop_level_points
+
+    def _min_dist(self, stop_level: float, tick_size: float) -> float:
+        """
+        Berechnet den minimalen Preisabstand (Pips) für Stop-Orders.
+        Verwendet Fallback, falls brokerseitiger stop_level <= 0.
+        """
+        level = stop_level if stop_level and stop_level > 0 else self.default_stop_level_points
+        return level * tick_size
+
+    def check_buy_stop(
+        self,
+        candles: List[Candle],
+        current_ask: float,
+        stop_level: float,
+        tick_size: float
+    ) -> Optional[Dict[str, float]]:
+        if self.pm.current_phase != Phase.BASE_SWITCH_BULL:
+            return None
+        if not is_confirmation_bullish(self.pm.current_phase, self.pm.context, candles):
+            return None
+
+        ctx = self.pm.context
+        prev_higher = ctx.get('switch_bull_prev_higher_high')
+        initial_low = ctx.get('switch_bull_initial_low')
+        if prev_higher is None or initial_low is None:
+            return None
+
+        prev = candles[-2]
+        min_dist = self._min_dist(stop_level, tick_size)
+        desired_entry = prev.high + self.spread
+
+        # Entry bleibt unverändert
+        if desired_entry - current_ask < min_dist:
+            entry_price = current_ask + min_dist
+        else:
+            entry_price = desired_entry
+
+        # === STOP-LOSS 2×Spread zum weitesten EMA ===
+        # 1) DataFrame bauen, EMAs berechnen
+        df       = pd.DataFrame([c._asdict() for c in candles])
+        ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
+        ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
+
+        # 2) Distanz zum letzten Schlusskurs
+        curr_close = candles[-1].close
+        dist_fast  = abs(curr_close - ema_fast)
+        dist_slow  = abs(curr_close - ema_slow)
+        ema_ref    = ema_fast if dist_fast > dist_slow else ema_slow
+
+        # 3) Stop unter dem EMA minus 2×Spread
+        stop_loss = ema_ref - 2 * self.spread
+
+        print(
+            f"[DEBUG] check_buy_stop: prev.high={prev.high}, spread={self.spread}, "
+            f"ema_fast={ema_fast}, ema_slow={ema_slow}, ema_ref={ema_ref}, "
+            f"stop_loss={stop_loss}, entry_price={entry_price}, ask={current_ask}"
+        )
+        return {"side": "buy", "entry_price": entry_price, "stop_loss": stop_loss}
+
+    def check_sell_stop(
+        self,
+        candles: List[Candle],
+        current_bid: float,
+        stop_level: float,
+        tick_size: float
+    ) -> Optional[Dict[str, float]]:
+        if self.pm.current_phase != Phase.BASE_SWITCH_BEAR:
+            return None
+        if not is_confirmation_bearish(self.pm.current_phase, self.pm.context, candles):
+            return None
+
+        ctx = self.pm.context
+        prev_lower = ctx.get('switch_bear_prev_lower_low')
+        initial_high = ctx.get('switch_bear_initial_high')
+        if prev_lower is None or initial_high is None:
+            return None
+
+        prev = candles[-2]
+        min_dist = self._min_dist(stop_level, tick_size)
+        desired_entry = prev.low - self.spread
+
+        # Entry bleibt unverändert
+        if current_bid - desired_entry < min_dist:
+            entry_price = current_bid - min_dist
+        else:
+            entry_price = desired_entry
+
+        # === STOP-LOSS 2×Spread zum weitesten EMA ===
+        df       = pd.DataFrame([c._asdict() for c in candles])
+        ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
+        ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
+
+        curr_close = candles[-1].close
+        dist_fast  = abs(curr_close - ema_fast)
+        dist_slow  = abs(curr_close - ema_slow)
+        ema_ref    = ema_fast if dist_fast > dist_slow else ema_slow
+
+        # Stop über dem EMA plus 2×Spread
+        stop_loss = ema_ref + 2 * self.spread
+
+        print(
+            f"[DEBUG] check_sell_stop: prev.low={prev.low}, spread={self.spread}, "
+            f"ema_fast={ema_fast}, ema_slow={ema_slow}, ema_ref={ema_ref}, "
+            f"stop_loss={stop_loss}, entry_price={entry_price}, bid={current_bid}"
+        )
+        return {"side": "sell", "entry_price": entry_price, "stop_loss": stop_loss}
