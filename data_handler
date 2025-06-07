@@ -10,6 +10,8 @@ from core.phase_manager import PhaseStateMachine
 import pytz
 from projectx_api import ProjectXAPI
 from datetime import datetime, timedelta
+import pandas as pd
+from config.timeframes import aggregate_candles
 
 
 
@@ -34,42 +36,55 @@ class DataHandler:
 
     def fetch_history(self, symbol: str, timeframe: int, limit: int) -> List[Candle]:
         """
-        Holt historische Kerzen über ProjectXAPI.
-        timeframe: Zeiteinheit in Sekunden (z. B. 900, 180, 15)
-        limit: Anzahl Kerzen
+        Holt historische Kerzen im kleinsten TF (15s) und aggregiert auf den gewünschten timeframe (in Sekunden).
         """
+        # 1) Zeitfenster berechnen
         end_time = datetime.utcnow()
-        start_time = end_time - timedelta(seconds=limit * timeframe)
-        
-        # 1) Die API liefert Roh-Candles im kleinsten Auflösungs-Timeframe (hier "S1"), wir aggregieren dann:
+        start_time = end_time - timedelta(seconds=timeframe * limit)
+
+        # 2) Rohdaten vom Server (15s-Bars) holen
         raw = self.api.get_candles(
             contract_id=symbol,
-            timeframe="S1",
-            start_time=None,
-            limit=limit * (timeframe // 15)
+            unit=4,                 # 4 = Sekunden
+            unit_number=15,         # 15s-Bars
+            limit=limit * (timeframe // 15),
+            live=False,
+            start_time=start_time,
+            end_time=end_time,
+            include_partial_bar=False
         )
 
-        # 2) Aggregation in den Ziel-Timeframe übernehmen:
-        agg = aggregate_candles(raw, timeframe)
+        # 3) Spalten umbenennen für Aggregation
+        df = pd.DataFrame(raw)
+        df.rename(columns={
+            "t": "timestamp",
+            "o": "open",
+            "h": "high",
+            "l": "low",
+            "c": "close",
+            "v": "volume"
+        }, inplace=True)
 
+        # 4) Auf Ziel-Timeframe aggregieren
+        agg = aggregate_candles(df.to_dict(orient="records"), timeframe)
+
+        # 5) In dein Candle-Objekt konvertieren
         candles: List[Candle] = []
-        for item in agg:
-            # item["timestamp"] ist ein Millisekunden-Timestamp
-            ts_utc = datetime.utcfromtimestamp(item["timestamp"] / 1000)
+        for bar in agg:
+            ts_ms = bar["timestamp"]
+            ts = datetime.utcfromtimestamp(ts_ms / 1000)
             candles.append(Candle(
-                timestamp=ts_utc,
-                open=item["open"],
-                high=item["high"],
-                low=item["low"],
-                close=item["close"],
-                volume=item["volume"]
+                timestamp=ts,
+                open=bar["open"],
+                high=bar["high"],
+                low=bar["low"],
+                close=bar["close"],
+                volume=bar["volume"]
             ))
 
-        # 3) In den Cache puffern und last_history_ts setzen:
+        # 6) Optional: Cache + Rückgabe
         self.histories.setdefault(symbol, {})[timeframe] = candles.copy()
-        self.last_history_ts.setdefault(symbol, {})[timeframe] = (
-            candles[-1].timestamp if candles else None
-        )
+        self.last_history_ts.setdefault(symbol, {})[timeframe] = candles[-1].timestamp if candles else None
 
         return candles
 
