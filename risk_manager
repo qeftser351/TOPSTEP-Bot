@@ -1,0 +1,425 @@
+import math
+from typing import List, Optional, Dict
+from core.types import Candle
+import time
+from projectx_api import ProjectXAPI
+
+class RiskManager:
+    """
+    RiskManager: Beinhaltet Logik für Positionsgröße, Break-Even und Trailing-Stop.
+    """
+    def __init__(self, api: ProjectXAPI, account_id: int, account_balance: float, symbol: str, spread: float, tick_size: float, max_risk_per_trade: float = 0.01):
+        self.api = api
+        self.account_balance = account_balance
+        self.max_risk = max_risk_per_trade
+        self.trailing_levels: Dict[int, int] = {}
+        self.account_id = account_id
+        self.tick_size = tick_size
+        self.spread = spread
+
+
+        
+
+    def _get_min_stop_distance(self, symbol: str, fallback_pips: float = 0.5) -> float:
+        contract = self.api.get_contract(symbol)
+        tick_size = contract.get("tickSize", None)
+        stops = contract.get("tradeStopsLevel", 0)
+        # 1) stops_level vom Broker, wenn vorhanden
+        if stops > 0 and tick_size:
+            return stops * tick_size
+
+        # 2) Fallback in Pips
+        #    pip_size = 10 * tick_size – funktioniert für 5- und 3-stellige Quoting-Paare
+        if not tick_size or tick_size <= 0:
+            raise ValueError(f"Ungültige tickSize für {symbol}: {tick_size}")
+
+        pip_size = tick_size * 10
+        warn_msg = (
+            f"[WARN] stops_level für {symbol} nicht verfügbar, "
+            f"verwende Fallback {fallback_pips} pips → {fallback_pips * pip_size}"
+        )
+        print(warn_msg)
+
+        return fallback_pips * pip_size
+
+
+
+
+    def get_pip_value(self, symbol: str) -> float:
+        contract      = self.api.get_contract(symbol)
+        contract_size = contract.get("contractSize", 1.0)
+        tick_size     = contract.get("tickSize", self.tick_size)
+        if tick_size is None or tick_size <= 0:
+            raise ValueError(f"Ungültige tickSize für {symbol}: {tick_size}")
+        return contract_size * tick_size
+
+
+    def calculate_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_loss: float,
+        side: str
+    ) -> float:
+        if entry_price is None or stop_loss is None:
+            raise ValueError("entry_price und stop_loss dürfen nicht None sein")
+        # 1) Verfügbares Risiko in Free Margin
+        details     = self.api.get_account_details(self.account_id)
+        free_margin = details.get("freeMargin", details.get("balance", 0.0))
+        risk_amount = free_margin * self.max_risk
+
+        # 2) Contract-Details holen
+        contract      = self.api.get_contract(symbol)
+        tick_size     = contract.get("tickSize", self.tick_size)
+        contract_size = contract.get("contractSize", 1.0)
+        
+        if tick_size is None or tick_size <= 0:
+            raise ValueError(f"Ungültige tickSize für {symbol}: {tick_size}")
+
+        # Stop-Distanz in Punkten
+        stop_distance = abs(entry_price - stop_loss)
+        if stop_distance <= 0:
+            return 0.0
+
+        # Pip-Wert
+        pip_value = contract_size * tick_size
+
+     # Positionsgröße nach Stop-Abstand
+        raw_lots = risk_amount / (stop_distance * pip_value)
+        return self.normalize_lots(symbol, raw_lots)
+    
+    def normalize_lots(self, symbol: str, desired_lots: float) -> float:
+        contract = self.api.get_contract_details(symbol)
+        min_vol  = contract.get("minVolume", 0.01)
+        max_vol  = contract.get("maxVolume", 100.0)
+        step_vol = contract.get("volumeStep", 0.01)
+
+        lots = max(min_vol, step_vol * round(desired_lots / step_vol))
+        return min(lots, max_vol)
+
+
+    def is_go_candle_bullish(
+        self,
+        candle: Candle,
+        entry_price: float
+    ) -> bool:
+        return candle.high >= entry_price and candle.close > entry_price
+
+
+    def is_go_candle_bearish(self, candle: Candle, entry_price: float) -> bool:
+        return candle.low <= entry_price and candle.close < entry_price
+
+
+    def calculate_breakeven_price_buy(
+        self,
+        symbol: str,
+        candles: List[Candle],
+        entry_price: float,
+        spread: float
+    ) -> Optional[float]:
+        quote = self.api.get_quote(contract_id=symbol)
+        go_candle = None
+        go_index = -1
+        
+
+        # 1) Finde Go-Kerze (Bullish)
+        for idx, c in enumerate(candles):
+            if c.high >= entry_price and c.close > entry_price:
+                go_candle = c
+                go_index = idx
+                break
+        if go_candle is None:
+            return None
+
+        # 2) Arbeite die Folgekerzen ab
+        following = candles[go_index + 1:]
+        confirmation_seen = False
+
+        for c in following:
+            # a) Bestätigung erkennen
+            if not confirmation_seen:
+                if c.close > go_candle.high and c.low > entry_price:
+                    confirmation_seen = True
+                # andernfalls, wenn Kerze low <= entry_price wieder berührt, reset
+                elif c.low <= entry_price:
+                    # suche ab nächster Kerze in 'candles' nach neuer Go-Kerze
+                    for j in range(go_index + 1, len(candles)):
+                        c2 = candles[j]
+                        if c2.high >= entry_price and c2.close > entry_price:
+                            go_candle = c2
+                            go_index = j
+                            following = candles[go_index + 1:]
+                            confirmation_seen = False
+                            break
+                    else:
+                        return None
+                    continue
+
+            # b) Erst nach Confirmation in der nächsten Kerze BE setzen
+            #    also, sobald confirmation_seen True und wir hier sind:
+            candidate_sl = entry_price - spread
+
+            # 3) Fallback-Distanz (nur hier!)
+            price_ref = quote["bid"]
+            min_dist = self._get_min_stop_distance(self.symbol, fallback_pips=0.5)
+            if candidate_sl >= price_ref - min_dist:
+                candidate_sl = price_ref - min_dist
+
+            # 4) Rundung auf gültigen Tick
+            contract  = self.api.get_contract(self.symbol)
+            tick_size = contract.get("tickSize", self.tick_size)
+            decimals = int(-math.log10(tick_size))
+            candidate_sl = math.floor(candidate_sl / tick_size) * tick_size
+            candidate_sl = round(candidate_sl, decimals)
+
+            return candidate_sl
+
+        return None
+
+
+
+    def calculate_breakeven_price_sell(
+        self,
+        symbol: str,
+        candles: List[Candle],
+        entry_price: float,
+        spread: float
+    ) -> Optional[float]:
+        quote = self.api.get_quote(contract_id=symbol)
+        go_candle = None
+        go_index = -1
+
+        # 1) Finde Go-Kerze (Bearish)
+        for idx, c in enumerate(candles):
+            if c.low <= entry_price and c.close < entry_price:
+                go_candle = c
+                go_index = idx
+                break
+        if go_candle is None:
+            return None
+
+        # 2) Arbeite die Folgekerzen ab
+        following = candles[go_index+1:]
+        confirmation_seen = False
+
+        for c in following:
+            # a) Bestätigung erkennen
+            if not confirmation_seen:
+                if c.close < go_candle.low and c.high < entry_price:
+                    confirmation_seen = True
+                # andernfalls, wenn Kerze high >= entry_price wieder berührt, reset
+                elif c.high >= entry_price:
+                    # neue Go-Kerze suchen (ab dem nächsten Index)
+                    for j in range(go_index+1, len(candles)):
+                        c2 = candles[j]
+                        if c2.low <= entry_price and c2.close < entry_price:
+                            go_candle = c2
+                            go_index  = j
+                            following  = candles[go_index+1:]
+                            confirmation_seen = False
+                            break
+                    else:
+                        return None
+                    continue
+
+            # b) Erst nach Confirmation in der nächsten Kerze BE setzen
+            candidate_sl = entry_price + spread
+
+            # 3) Fallback-Distanz (nur hier!)
+            price_ref = quote["ask"]
+            min_dist  = self._get_min_stop_distance(self.symbol, fallback_pips=0.5)
+            if candidate_sl <= price_ref + min_dist:
+                candidate_sl = price_ref + min_dist
+
+            # 4) Rundung auf gültigen Tick
+            contract  = self.api.get_contract(self.symbol)
+            tick_size = contract.get("tickSize", self.tick_size)
+            decimals = int(-math.log10(tick_size))
+            candidate_sl = math.floor(candidate_sl / tick_size) * tick_size
+            candidate_sl = round(candidate_sl, decimals)
+
+            return candidate_sl
+
+        return None
+
+
+
+
+    def trailing_step_buy(self, candles, entry_price, rr, current_sl, last_level):
+        max_high = max([c.high for c in candles], default=entry_price)
+        level = int((max_high - entry_price) / rr)
+        if level >= 3 and level > last_level:
+            candidate = entry_price + (level - 2) * rr
+            if candidate > current_sl:
+                return candidate, level
+        return None, last_level
+
+    def trailing_step_sell(self, candles, entry_price, rr, current_sl, last_level):
+        min_low = min([c.low for c in candles], default=entry_price)
+        level = int((entry_price - min_low) / rr)
+        if level >= 3 and level > last_level:
+            candidate = entry_price - (level - 2) * rr
+            if candidate < current_sl:
+                return candidate, level
+        return None, last_level
+
+    def try_break_even(
+        self,
+        symbol: str,
+        candles: List[Candle],
+        side: str,
+        entry_price: float,
+        spread: float,
+        current_sl: float,
+        ticket: int
+    ) -> Optional[float]:
+        # 1) Contract-Details holen
+        contract  = self.api.get_contract(self.symbol)
+        tick_size = contract.get("tickSize", self.tick_size)
+        stops     = contract.get("tradeStopsLevel", 0)
+        min_dist = (
+            stops * tick_size
+            if stops > 0
+            else self._get_min_stop_distance(self.symbol, 0.5)
+        )
+        # 2) Go-Candle finden (Identisch zur MT5-Logik)
+        go_idx = next(
+            (i for i, c in enumerate(candles)
+            if (side == 'buy' and c.high >= entry_price and c.close > entry_price)
+            or (side == 'sell' and c.low <= entry_price and c.close < entry_price)),
+            None
+        )
+        if go_idx is None:
+            return None
+        relevant = candles[go_idx:]
+        # 3) Neues SL berechnen
+        new_sl = (
+            self.calculate_breakeven_price_buy(relevant, entry_price, spread)
+            if side == 'buy'
+            else self.calculate_breakeven_price_sell(relevant, entry_price, spread)
+        )
+        if new_sl is None or new_sl == current_sl:
+            return None
+        # 4) Preisreferenz aus Quote holen
+        quote = self.api.get_quote(contract_id=symbol)
+        price_ref = quote["bid"] if side=='buy' else quote["ask"]
+        # 5) Clamp ↔ min_dist prüfen
+        if abs(new_sl - price_ref) < min_dist:
+            new_sl = price_ref - min_dist if side=='buy' else price_ref + min_dist
+        # 6) Auf Tick-Größe runden
+        decimals = int(-math.log10(tick_size))
+        if side == 'buy':
+            new_sl = math.ceil(new_sl / tick_size) * tick_size
+        else:
+            new_sl = math.floor(new_sl / tick_size) * tick_size
+        new_sl = round(new_sl, decimals)
+        # 7) Tatsächlich SL ändern über API
+        try:
+            self.api.update_position_stop(position_id=ticket, stop_loss=new_sl)
+        except Exception as e:
+            print(f"[ERROR] Break-Even fehlgeschlagen: {e}")
+            return None
+        self.trailing_levels[ticket] = 0  # optional: Reset trailing-level nach BE
+        return new_sl
+
+
+
+
+    
+    def try_trailing(
+        self,
+        symbol: str,
+        candles: List[Candle],
+        side: str,
+        entry_price: float,
+        initial_stop: float,
+        current_sl: float,
+        ticket: int
+    ) -> Optional[float]:
+        """
+        Berechnet und setzt einen neuen Trailing-Stop über die ProjectXAPI.
+        Rückgabe: das neue SL-Level oder None, falls kein Update erfolgt.
+        """
+        import math
+
+        # 1) Contract-Details holen (für tickSize und tradeStopsLevel)
+        contract  = self.api.get_contract(symbol)
+        tick_size = contract.get("tickSize", self.tick_size)
+        stops_level = contract.get("tradeStopsLevel", 0)
+
+        # 2) Mindest-Abstand fürs SL bestimmen
+        if stops_level > 0:
+            min_dist = stops_level * tick_size
+        else:
+            pip_size = tick_size * 10
+            min_dist = 0.5 * pip_size
+
+        # 3) Neues Trailing-Level berechnen
+        rr = abs(entry_price - initial_stop)
+        last_level = self.trailing_levels.get(ticket, 0)
+
+        # Ermitteln, wie viele RR es sind
+        if side == 'buy':
+            max_high = max((c.high for c in candles), default=entry_price)
+            level = int((max_high - entry_price) / rr) if rr > 0 else 0
+            if level >= 3 and level > last_level:
+                candidate = entry_price + (level - 2) * rr
+            else:
+                return None
+        else:
+            min_low = min((c.low for c in candles), default=entry_price)
+            level = int((entry_price - min_low) / rr) if rr > 0 else 0
+            if level >= 3 and level > last_level:
+                candidate = entry_price - (level - 2) * rr
+            else:
+                return None
+
+        # 4) Quote holen, um kandidat vs. Markt zu prüfen
+        quote = self.api.get_quote(contract_id=symbol)
+        price_ref = quote["bid"] if side == 'buy' else quote["ask"]
+
+        # Clamp: Nie näher als min_dist zum aktuellen Preis
+        if side == 'buy':
+            # Trailing-Stop darf maximal bei price_ref - min_dist liegen
+            candidate = min(candidate, price_ref - min_dist)
+        else:
+            candidate = max(candidate, price_ref + min_dist)
+
+        # Falls nach Clamp noch zu nah am Markt, hart auf price_ref ± min_dist setzen
+        if abs(candidate - price_ref) < min_dist:
+            if side == 'buy':
+                candidate = price_ref - min_dist
+            else:
+                candidate = price_ref + min_dist
+
+        # 5) Rundung auf gültige Tick-Größe
+        decimals = int(-math.log10(tick_size))
+        if side == 'buy':
+            candidate = math.ceil(candidate / tick_size) * tick_size
+        else:
+            candidate = math.floor(candidate / tick_size) * tick_size
+        candidate = round(candidate, decimals)
+
+        # 6) Prüfen, ob Position noch existiert
+        positions = self.api.get_positions(self.account_id)
+        for p in positions:
+            if p.get("positionId") == ticket:
+                break
+        else:
+            # Position nicht mehr offen
+            return None
+
+        # 7) Trailing-Stop über API setzen
+        try:
+            self.api.update_position_stop(position_id=ticket, stop_loss=candidate)
+        except Exception as e:
+            print(f"[ERROR] Trailing-Stop konnte nicht gesetzt werden: {e}")
+            return None
+
+        # 8) Erfolgreiches Update → trailing_level aktualisieren
+        self.trailing_levels[ticket] = level
+        return candidate
+
+
+
+
