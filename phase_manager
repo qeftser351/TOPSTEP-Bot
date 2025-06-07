@@ -1,0 +1,146 @@
+# core/phase_manager.py
+"""
+State Machine für Phasen-Übergänge. Liest PHASE_RULES aus config/phases.py und wendet sie an.
+"""
+from typing import List
+from config.phase import PHASE_RULES
+from core.types import PhaseRule, Phase, Candle, ContextStore
+
+
+
+
+class PhaseStateMachine:
+    def __init__(self):
+        # Regeln & Context initialisieren
+        self.rules: List[PhaseRule] = PHASE_RULES
+        self.current_phase: Phase = None
+        # self.previous_phase nicht mehr nötig, wir nutzen ausschließlich context['prev_phase']
+        self.context: ContextStore = ContextStore()
+        # direkt initialen Default setzen
+        self.context['prev_phase'] = Phase.NEUTRAL
+    
+    def replay_from_scratch(self, candles: List[Candle]) -> Phase:
+        self.reset()
+        phase = Phase.NEUTRAL
+        for i in range(len(candles)):
+            buf = candles[:i+1]
+            phase = self.update(buf)
+            self.context['prev_phase'] = phase
+        return phase
+
+    
+    def reset(self):
+        self.context.clear()
+        self.context['prev_phase'] = Phase.NEUTRAL
+        # Optional:
+        self.current_phase = Phase.NEUTRAL
+
+    def update(self, candles: List[Candle]) -> Phase:
+        self.context['last_candles'] = candles
+        prev_phase = self.context.get('prev_phase', Phase.NEUTRAL)
+
+        for rule in self.rules:
+            if rule.from_phase == prev_phase and rule.condition(prev_phase, self.context):
+                new_phase = rule.to_phase
+                # ← Context-Reset HIER
+                self._cleanup_context_on_phase_change(prev_phase, new_phase)
+                self.context['prev_phase'] = new_phase
+                self.current_phase = new_phase
+                return new_phase
+
+        self.current_phase = prev_phase
+        return self.current_phase
+
+    def _cleanup_context_on_phase_change(self, prev_phase, new_phase):
+        # Trend beendet, zurück zu Base – Trend-Kontext löschen!
+        if prev_phase == Phase.TREND_BULL and new_phase == Phase.BASE_BULL:
+            self.context.pop('trend_bull_initial_high', None)
+        if prev_phase == Phase.TREND_BEAR and new_phase == Phase.BASE_BEAR:
+            self.context.pop('trend_bear_initial_low', None)
+        # Optional: Mehr Context-Keys je nach Komplexität deiner Phasenlogik
+
+
+
+    def _apply_rules(self, candles: List[Candle]) -> Phase:
+        """
+        Prüft alle Regeln für den aktuellen prev_phase.
+        Gibt die erste passende to_phase zurück.
+        """
+        prev = self.current_phase
+        for rule in self.rules:
+            if rule.from_phase == prev and rule.condition(prev, candles, self.context):
+                return rule.to_phase
+        return prev
+
+    def _handle_special_logic(self, new_phase: Phase, candles: List[Candle]):
+        """
+        Sammelt Sonderlogik beim Übergang: Initial Low/High und Extremes.
+        """
+        if new_phase == Phase.SWITCH_BULL:
+            self._store_switch_bull_context(candles)
+        elif new_phase == Phase.SWITCH_BEAR:
+            self._store_switch_bear_context(candles)
+        # Base_Switch und Trend Kontext kann hier ergänzt werden
+
+    def _store_switch_bull_context(self, candles: List[Candle]):
+        idx = len(candles) - 1
+        # Wenn es keine vorherige Kerze gibt, abbrechen
+        if idx < 1:
+            return
+        # 1) Candidate ist das Low der Kerze direkt vor dem Switch
+        candidate_low = candles[idx-1].low
+        # 2) Rückwärts-Loop: Solange wir tiefere Tiefs finden, weitersuchen.
+        #    Sobald das Low einer Kerze höher ist, brechen wir ab.
+        pivot_idx = idx - 1
+        for i in range(idx-2, -1, -1):
+            low_i = candles[i].low
+            if low_i < candidate_low:
+                candidate_low = low_i
+                pivot_idx = i
+            else:
+                break
+        # 3) Das finale candidate_low ist unser Initial Low
+        self.context['switch_bull_initial_low'] = candidate_low
+        # 3) Nimm das High der Initial‑Low-Kerze als Threshold
+        initial_low_high = candles[pivot_idx].high
+        # 4) Such in der Vergangenheit (vor pivot_idx) das erste High > initial_low_high
+        prev_high = next(
+            (c.high for c in reversed(candles[:pivot_idx]) if c.high > initial_low_high),
+            None
+        )
+        self.context['switch_bull_prev_higher_high'] = prev_high
+        
+            # ← Debug-Ausgabe direkt hier:
+        print(f"[CTX SET] switch_bull_initial_low={candidate_low}, "
+          f"switch_bull_prev_higher_high={prev_high}")
+
+
+
+    def _store_switch_bear_context(self, candles: List[Candle]):
+        # Index der aktuellen (Switch‑Bear) Kerze
+        idx = len(candles) - 1
+        # Wenn keine vorherige Kerze existiert, abbrechen
+        if idx < 1:
+            return
+        # 1) Start‑Hoch ist das Hoch der Kerze direkt vor dem Switch
+        candidate_high = candles[idx-1].high
+        pivot_idx = idx - 1
+        # 2) Rückwärts‑Loop: solange wir höhere Hochs finden, weitersuchen.
+        #    Sobald ein Hoch niedriger oder gleich ist, beenden
+        for i in range(idx-2, -1, -1):
+            high_i = candles[i].high
+            if high_i > candidate_high:
+                candidate_high = high_i
+                pivot_idx = i
+            else:
+                break
+        # 3) Das finale candidate_high ist unser Initial High
+        self.context['switch_bear_initial_high'] = candidate_high
+     # 3) Low der Initial‑High‑Kerze als Threshold
+        initial_high_low = candles[pivot_idx].low
+        # 4) Suche in der Vergangenheit (vor pivot_idx) das erste Low < initial_high_low
+        prev_low = next(
+            (c.low for c in reversed(candles[:pivot_idx]) if c.low < initial_high_low),
+            None
+        )
+        self.context['switch_bear_prev_lower_low'] = prev_low
