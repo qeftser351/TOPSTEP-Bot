@@ -1,0 +1,62 @@
+from enum import Enum
+from typing import NamedTuple, Callable, List, Any, Dict
+from datetime import datetime
+
+# --------------------------------------------
+# Candle‑Definition (API-Ready)
+# --------------------------------------------
+class Candle(NamedTuple):
+    timestamp: datetime  # UTC datetime, muss beim Einlesen aus API ms→datetime konvertiert werden
+    open: float
+    high: float
+    low: float
+    close: float
+    volume: float
+
+def dicts_to_candles(dict_list: List[Dict[str, Any]]) -> List[Candle]:
+    """
+    Wandelt eine Liste von Candle-Dicts aus der API/Aggregation in Candle-NamedTuples um.
+    Erwartet timestamp in ms.
+    """
+    return [
+        Candle(
+            timestamp=datetime.utcfromtimestamp(item['timestamp'] / 1000),
+            open=item['open'],
+            high=item['high'],
+            low=item['low'],
+            close=item['close'],
+            volume=item['volume']
+        )
+        for item in dict_list
+    ]
+
+# --------------------------------------------
+# Phase‑Enum
+# --------------------------------------------
+class Phase(Enum):
+    NEUTRAL           = "Neutral"
+    BASE_SWITCH_BEAR  = "Base_Switch_Bear"
+    SWITCH_BEAR       = "Switch_Bear"
+    TREND_BEAR        = "Trend_Bear"
+    BASE_BEAR         = "Base_Bear"
+    SWITCH_BULL       = "Switch_Bull"
+    BASE_SWITCH_BULL  = "Base_Switch_Bull"
+    TREND_BULL        = "Trend_Bull"
+    BASE_BULL         = "Base_Bull"
+
+# --------------------------------------------
+# ContextStore für Sonderlogik
+# --------------------------------------------
+class ContextStore(dict):
+    """Speichert Sonderlogik-Daten wie Initial-Lows/Highs und Extremes."""
+    pass
+
+# --------------------------------------------
+# PhaseRule für Transitionen
+# --------------------------------------------
+PhaseCondition = Callable[[Phase, List[Candle], ContextStore], bool]
+
+class PhaseRule(NamedTuple):
+    from_phase: Phase
+    to_phase: Phase
+    condition: PhaseCondition
