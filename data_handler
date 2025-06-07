@@ -1,0 +1,276 @@
+import time
+from datetime import datetime
+import math
+from typing import Dict, List, Callable, Optional
+from types import SimpleNamespace
+from core.types import Candle
+from config.timeframes import get_history_limit, aggregate_candles, TIMEFRAMES
+get_history_limit = lambda tf: int(300 * (tf / 15))
+from core.phase_manager import PhaseStateMachine
+import pytz
+from projectx_api import ProjectXAPI
+from datetime import datetime, timedelta
+
+
+
+class DataHandler:
+    # Mapping von MT5-Konstanten auf interne Labels (nur als Referenz, wird hier nicht verwendet)
+    TIMEFRAME_MAP: Dict[int, str] = {
+        # mt5.TIMEFRAME_M1:  '1m',
+        # mt5.TIMEFRAME_M15: '15m',
+        # mt5.TIMEFRAME_H1:  '1h',
+    }
+
+    def __init__(self, api: ProjectXAPI, account_id: int):
+        self.api = api
+        self.account_id = account_id
+        self.histories: Dict[str, Dict[int, List[Candle]]] = {}
+        self.subscribers: Dict[str, Dict[int, List[Callable]]] = {}
+        self.phase_machine = PhaseStateMachine()
+        self._running = False
+        self.open_ticket: Optional[int] = None
+        self._pending_to_position: Dict[str, Dict[int, int]] = {}
+        self.last_history_ts: Dict[str, Dict[int, Optional[datetime]]] = {}
+
+    def fetch_history(self, symbol: str, timeframe: int, limit: int) -> List[Candle]:
+        """
+        Holt historische Kerzen über ProjectXAPI.
+        timeframe: Zeiteinheit in Sekunden (z. B. 900, 180, 15)
+        limit: Anzahl Kerzen
+        """
+        end_time = datetime.utcnow()
+        start_time = end_time - timedelta(seconds=limit * timeframe)
+        
+        # 1) Die API liefert Roh-Candles im kleinsten Auflösungs-Timeframe (hier "S1"), wir aggregieren dann:
+        raw = self.api.get_candles(
+            contract_id=symbol,
+            timeframe="S1",
+            start_time=None,
+            limit=limit * (timeframe // 15)
+        )
+
+        # 2) Aggregation in den Ziel-Timeframe übernehmen:
+        agg = aggregate_candles(raw, timeframe)
+
+        candles: List[Candle] = []
+        for item in agg:
+            # item["timestamp"] ist ein Millisekunden-Timestamp
+            ts_utc = datetime.utcfromtimestamp(item["timestamp"] / 1000)
+            candles.append(Candle(
+                timestamp=ts_utc,
+                open=item["open"],
+                high=item["high"],
+                low=item["low"],
+                close=item["close"],
+                volume=item["volume"]
+            ))
+
+        # 3) In den Cache puffern und last_history_ts setzen:
+        self.histories.setdefault(symbol, {})[timeframe] = candles.copy()
+        self.last_history_ts.setdefault(symbol, {})[timeframe] = (
+            candles[-1].timestamp if candles else None
+        )
+
+        return candles
+
+    def append_and_get(self, symbol: str, timeframe: int, candle: Candle) -> List[Candle]:
+        # Timestamp in UTC-naiv umwandeln, falls nötig:
+        if candle.timestamp.tzinfo is not None:
+            candle_ts = candle.timestamp.astimezone(pytz.UTC).replace(tzinfo=None)
+            candle = Candle(
+                timestamp=candle_ts,
+                open=candle.open,
+                high=candle.high,
+                low=candle.low,
+                close=candle.close,
+                volume=candle.volume
+            )
+
+        if timeframe not in self.histories.get(symbol, {}):
+            limit = get_history_limit(timeframe)
+            self.fetch_history(symbol, timeframe, limit)
+
+        buf = self.histories[symbol][timeframe]
+        last_hist_ts = self.last_history_ts.get(symbol, {}).get(timeframe)
+
+        if last_hist_ts and candle.timestamp == last_hist_ts:
+            # Bereits vorhanden, nichts ändern
+            self.last_history_ts[symbol][timeframe] = None
+            return buf
+
+        buf.append(candle)
+        self.last_history_ts[symbol][timeframe] = candle.timestamp
+        return buf
+
+    def subscribe(self, symbol: str, timeframe: int, callback: Callable):
+        # Nur unsere Sekunden-basierten Timeframes (K=900, B=180, E=15) zulassen
+        if timeframe not in TIMEFRAMES:
+            raise RuntimeError(f"Unsupported timeframe: {timeframe}")
+
+        subs = self.subscribers.setdefault(symbol, {})
+        if timeframe not in subs:
+            # Historie laden und FSM initialisieren
+            history = self.fetch_history(symbol, timeframe, get_history_limit(timeframe))
+            self.phase_machine.replay_from_scratch(history)
+            subs[timeframe] = []
+
+        if callback not in subs[timeframe]:
+            subs[timeframe].append(callback)
+            print(f"[DEBUG] Subscriber registriert: Symbol={symbol}, TF={timeframe}, CB={callback}")
+        else:
+            print(f"[DEBUG] Subscriber bereits vorhanden: Symbol={symbol}, TF={timeframe}, CB={callback}")
+
+    def get_symbol_info(self, symbol: str) -> SimpleNamespace:
+        contract = self.api.get_contract(symbol)
+        if not contract:
+            raise RuntimeError(f"API: Contract-Details nicht verfügbar für {symbol}")
+
+        quote    = self.api.get_quote(contract_id=symbol)
+        if not quote:
+            raise RuntimeError(f"API: Quote nicht verfügbar für {symbol}")
+
+        return SimpleNamespace(
+            bid=quote.get("bid"),
+            ask=quote.get("ask"),
+            stop_level=contract.get("tradeStopsLevel", 0),
+            tick_size  = contract.get("tickSize", 0.0)
+        )
+
+    def place_order(
+        self,
+        symbol: str,
+        side: str,
+        price: float,
+        size: float,
+        stop_loss: float
+    ):
+        # 1) Contract-Details holen, um Tick-Size & Min/Max-Volumen zu kennen
+        contract = self.api.get_contract(symbol)
+        if not contract:
+            print(f"[ERROR] Contract-Details für {symbol} nicht verfügbar")
+            return None
+
+        tick_size = contract.get("tickSize", None)
+        if tick_size is None or tick_size <= 0:
+            print(f"[ERROR] Ungültige Tick-Größe für {symbol}")
+            return None
+
+        # 2) Preis und Stop-Loss auf gültige Ticks runden
+        rounded_price = round(price / tick_size) * tick_size
+
+        # 3) Volumen innerhalb erlaubter Range runden
+        min_vol = contract.get("minVolume", 0.01)
+        max_vol = contract.get("maxVolume", 100.0)
+        step_vol = contract.get("volumeStep", 0.01)
+        adj_size = max(min(size, max_vol), min_vol)
+        adj_size = math.floor(adj_size / step_vol) * step_vol
+
+        # 4) Order per API senden
+        try:
+            res = self.api.place_order(
+                account_id=self.account_id,
+                contract_id=symbol,
+                order_type="STOP",
+                side=side,
+                size=adj_size,
+                stop_price=stop_loss,
+                price=price,
+                custom_tag="234000"
+            )
+            print(f"[INFO] place_order → {res}")
+            return res
+        except Exception as e:
+            print(f"[ERROR] API place_order gescheitert: {e}")
+            return None
+
+    def cancel_order(self, ticket: int):
+        try:
+            res = self.api.cancel_order(order_id=ticket)
+            print(f"[INFO] cancel_order → {res}")
+            return res
+        except Exception as e:
+            print(f"[ERROR] API cancel_order gescheitert: {e}")
+            return None
+        
+    def subscribe_candles(self, contract_id: str, timeframe: int, callback: Callable):
+        self.subscribe(symbol=contract_id, timeframe=timeframe, callback=callback)
+
+
+    # Go-Candle Detection (unverändert)
+    def is_go_candle_bullish(candle: Candle, entry_price: float) -> bool:
+        return candle.low <= entry_price and candle.close > entry_price
+
+    def is_go_candle_bearish(candle: Candle, entry_price: float) -> bool:
+        return candle.high >= entry_price and candle.close < entry_price
+
+    def modify_order(
+        self,
+        symbol: str,
+        ticket: int,
+        new_sl: float,
+        new_tp: float = 0.0
+    ):
+        # 1) Mapping: Falls vorhanden, mappe Pending-Ticket → Position-Ticket
+        position_id = self._pending_to_position.get(symbol, {}).get(ticket, ticket)
+
+        # 2) Stop/TP per API updaten
+        try:
+            res = self.api.update_position_stop(
+                position_id=position_id,
+                stop_loss=new_sl,
+                take_profit=new_tp
+            )
+            print(f"[INFO] modify_order → {res}")
+            return res
+        except Exception as e:
+            print(f"[ERROR] API update_position_stop gescheitert: {e}")
+            return None
+
+    def run(self):
+        self._running = True
+        while self._running:
+            for symbol, tfs in self.subscribers.items():
+                # 1) hole immer nur die letzte abgeschlossene 15-Sekunden-Bar
+                latest_raw = self.api.get_latest_candle(
+                    contract_id=symbol,
+                    unit=4,            # Sekunden
+                    unit_number=15     # 15-Sekunden-Bars
+                )
+                if not latest_raw:
+                    continue
+
+                # 2) für jeden abonnierten TF aggregieren und verarbeiten
+                for tf, callbacks in tfs.items():
+                    # aggregate_candles erwartet eine Liste von Roh-Bars
+                    agg = aggregate_candles([latest_raw], tf)
+                    if not agg:
+                        continue
+
+                    # wir haben genau eine neue aggregierte Kerze
+                    item = agg[0]
+                    ts = datetime.utcfromtimestamp(item["timestamp"] / 1000)
+
+                    # 3) schon verarbeitet? → überspringen
+                    prev = self.last_history_ts.setdefault(symbol, {}).get(tf)
+                    if prev is not None and ts <= prev:
+                        continue
+
+                    #4) Timestamp merken, Candle bauen, FSM updaten
+                    self.last_history_ts[symbol][tf] = ts
+                    candle = Candle(
+                        timestamp=ts,
+                        open=item["open"],
+                        high=item["high"],
+                        low=item["low"],
+                        close=item["close"],
+                        volume=item["volume"]
+                    )
+                    self.histories.setdefault(symbol, {}).setdefault(tf, []).append(candle)
+                    _ = self.phase_machine.update(self.histories[symbol][tf])
+
+                    # 5) Callback feuern
+                    for cb in callbacks:
+                        cb(candle)
+
+            time.sleep(1)
+
