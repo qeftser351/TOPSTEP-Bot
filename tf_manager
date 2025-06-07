@@ -84,10 +84,14 @@ class MultiTimeframeController:
         self.entry_timestamps: Dict[int, float] = {}
 
         # Risk-Manager
-        self.risk_mgr = RiskManager(api, account_id, account_balance)
-        self.risk_mgr.symbol = symbol
-        self.risk_mgr.spread = spread
-        self.risk_mgr.tick_size = tick_size
+        self.risk_mgr = RiskManager(
+            api=api,
+            account_id=account_id,
+            account_balance=account_balance,
+            symbol=symbol,
+            spread=spread,
+            tick_size=tick_size
+        )
         
         #Breakeven schon gesetzt
         self.break_even_applied: Dict[int, bool] = {}
