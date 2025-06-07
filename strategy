@@ -1,0 +1,98 @@
+from config.timeframes import K, B, E
+from core.tf_manager import MultiTimeframeController
+from core.phase_manager import Candle
+from projectx_api import ProjectXAPI
+from datetime import datetime, timedelta
+
+
+def max_lots(api: ProjectXAPI, account_id: int, symbol: str, risk_per_trade: float = 0.01) -> float:
+    """
+    Berechnet, wie viele Lots basierend auf risk_per_trade-Prozent der freien Margin
+    für das gegebene Symbol maximal platziert werden können.
+    """
+    # 1) Hole Kontodetails über den Wrapper
+    details = api.get_account_details(account_id)
+    if details is None:
+        raise RuntimeError("API: Konto-Details nicht abrufbar")
+    free_margin = details.get("freeMargin", details.get("balance", 0.0))
+
+    # 2) Hole den aktuellen Preis (Ask oder Bid) über den Wrapper
+    quote = api.get_quote(contract_id=symbol)
+    if not quote:
+        raise RuntimeError(f"API: Quote nicht verfügbar für {symbol}")
+    price = quote.get("ask") or quote.get("bid")
+    if price is None:
+        raise RuntimeError(f"API: Ask/Bid nicht verfügbar für {symbol}")
+
+    # 3) Bestimme die Margin-Anforderung für 1 Lot (je nachdem, welche Feldnamen dein Wrapper liefert):
+    #    Wir gehen davon aus, dass unter "contractDetails" ein Feld "initialMargin" oder "marginInitial" steht.
+    contract = api.get_contract_details(symbol)
+    if not contract:
+        raise RuntimeError(f"API: Contract-Details nicht verfügbar für {symbol}")
+    # Beispiel: falls sich Margin-Bedarf explizit im Dictionary findet:
+    margin_per_lot = contract.get("initialMargin") or contract.get("marginInitial")
+    if margin_per_lot is None:
+        # Fallback: falls keine eigene Margin-Angabe vorhanden ist, approximiere über price und contractSize
+        contract_size = contract.get("contractSize", 1.0)
+        margin_per_lot = price * contract_size
+
+    # 4) Berechne erlaubte Lots anhand des Risikoprozentsatzes
+    allowed = (free_margin * risk_per_trade) / margin_per_lot
+
+    # 5) Runden auf zwei Dezimalstellen
+    return round(allowed, 2)
+
+
+
+class TradingStrategy:
+    def __init__(
+        self,
+        symbol: str,
+        data_handler,
+        api: ProjectXAPI,
+        account_id: int,
+        account_balance: float,
+        tick_size: float,
+        spread: float
+    ):
+        self.symbol = symbol
+        self.api = api
+        self.account_id = account_id
+
+        self.controller = MultiTimeframeController(
+            symbol=symbol,
+            api=api,
+            account_id=account_id,
+            account_balance=account_balance,
+            tick_size=tick_size,
+            spread=spread,
+            data_handler=data_handler,
+        )
+
+
+    def start(self) -> None:
+        # Erstinitialisierung
+        self.controller.initialize()
+
+        # Abonniere neue Kerzen (Candles) für alle Timeframes über den API-Wrapper
+        for tf in (K, B, E):
+            # Beispiel: data_handler hat jetzt eine Methode `subscribe_candles`
+            self.controller.data.subscribe_candles(
+                contract_id=self.symbol,
+                timeframe=tf,
+                callback=lambda raw, tf=tf: self._on_candle(tf, raw)
+            )
+
+
+    def _on_candle(self, timeframe: int, raw_candle) -> None:
+        # Angenommen, raw_candle ist jetzt ein Dict:
+        # { "timestamp": 1630000000000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }
+        c = Candle(
+            timestamp=datetime.utcfromtimestamp(raw_candle["timestamp"] / 1000),
+            open=raw_candle["open"],
+            high=raw_candle["high"],
+            low=raw_candle["low"],
+            close=raw_candle["close"],
+            volume=raw_candle["volume"]
+        )
+        self.controller.on_new_candle(timeframe, c)
