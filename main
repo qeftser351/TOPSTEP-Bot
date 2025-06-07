@@ -1,0 +1,171 @@
+# main.py
+"""
+Bootstrapping: Initialisiert ProjectXAPI, DataHandler, Strategie und startet das Event-Loop.
+"""
+import os
+import threading
+import signal
+import sys
+import time
+from dotenv import load_dotenv, find_dotenv
+
+from projectx_api import ProjectXAPI
+from data_handler import DataHandler
+from strategy import TradingStrategy
+from config.timeframes import K, B, E  # Sekunden-Timeframes: 900, 180, 15
+from typing import Dict
+
+load_dotenv(find_dotenv(), override=True)
+
+def start_periodic_summary(strategies: Dict[str, TradingStrategy], interval: int = 30):
+    """
+    Ruft strat.controller.print_summary() für jede Strategie alle `interval` Sekunden auf.
+    """
+    def _report():
+        for strat in strategies.values():
+            strat.controller.print_summary()
+        t = threading.Timer(interval, _report)
+        t.daemon = True
+        t.start()
+
+    t0 = threading.Timer(interval, _report)
+    t0.daemon = True
+    t0.start()
+
+
+def shutdown(signum, frame):
+    """Signal-Handler für Strg+C oder SIGTERM."""
+    print("\nStop signal received, shutting down …")
+    try:
+        handler.stop()
+    except Exception:
+        pass
+    sys.exit(0)
+
+
+def resolve_contract_id_by_name(api: ProjectXAPI, symbol_name: str):
+    contracts = api.search_contracts(search_text=symbol_name)
+    for c in contracts:
+        if symbol_name in (c.get("name", ""), c.get("description", ""), c.get("id", "")):
+            return c
+    raise ValueError(f"Kein Contract mit Bezug zu '{symbol_name}' gefunden.")
+
+
+if __name__ == '__main__':
+    signal.signal(signal.SIGINT, shutdown)
+    signal.signal(signal.SIGTERM, shutdown)
+
+    load_dotenv()
+
+    # ProjectXAPI benötigt jetzt username und api_key:
+    try:
+        API_USER   = os.environ['API_USER']
+        API_KEY    = os.environ['API_KEY']
+    except KeyError as e:
+        raise RuntimeError(f"Umgebungsvariable {e.args[0]} fehlt")
+
+    api = ProjectXAPI(username=API_USER, api_key=API_KEY)
+
+
+    candles = api.get_candles(
+        contract_id="CON.F.US.MNQ.M25",
+        unit=4,              # 3 = Minute
+        unit_number=15,
+        limit=50,
+        live=False
+    )
+    for c in candles:
+        print(c)
+
+
+    # Konto‐ID und Kontodetails holen
+    accounts = api.get_active_accounts()
+    if not accounts:
+        raise RuntimeError("Kein aktives Konto gefunden")
+    
+    print("→ Erste Account-Struktur:", accounts[0])
+
+    account_id = accounts[0]['id']  # oder spezifisch auswählen
+    acct = accounts[0]
+    account_id = acct['id']
+    INITIAL_BALANCE = acct.get("balance", 0.0)
+
+
+    if account_id is None:
+        raise RuntimeError("API: Konto‐Informationen konnten nicht abgerufen werden")
+    
+  
+# Debug: verfügbare Kontrakte auflisten
+contracts = api.search_contracts(search_text="MNQ")
+for c in contracts:
+    print(c.get("id"), c.get("name"), c.get("description"))
+
+# Symbolnamen definieren
+SYMBOL_NAMES = ["MNQM5"]
+SYMBOLS = []
+symbol_params = {}
+
+# Kontrakt-ID + Parameter ermitteln
+for name in SYMBOL_NAMES:
+    try:
+        contract = resolve_contract_id_by_name(api, name)
+        contract_id = contract["id"]
+    except Exception as e:
+        raise RuntimeError(f"API-Suche für '{name}' fehlgeschlagen: {e}")
+
+    print(f"→ Gefundener Contract für {name}: {contract.get('id')} / {contract.get('description')}")
+
+    SYMBOLS.append(contract_id)
+
+    tick_size = contract.get("tickSize")
+    if tick_size is None or tick_size <= 0:
+        raise RuntimeError(f"Ungültige Tick-Größe für {name}")
+
+    try:
+        quote = api.get_quote(contract_id=contract_id)
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        if bid is None or ask is None:
+            raise ValueError("Bid oder Ask fehlt")
+        spread = ask - bid
+    except Exception as e:
+        print(f"⚠️  Quote für {name} konnte nicht geladen werden: {e}")
+        spread = 0  # Fallback
+
+    symbol_params[contract_id] = {
+        'tick_size': tick_size,
+        'spread': spread
+    }
+
+
+
+
+    # DataHandler erstellen (benötigt API und account_id)
+    handler = DataHandler(api, account_id)
+
+    # Für jedes Symbol eine eigene Strategie anlegen, initialisieren und abonnieren
+    strategies: Dict[str, TradingStrategy] = {}
+    for sym in SYMBOLS:
+        params = symbol_params[sym]
+        strat = TradingStrategy(
+            symbol=sym,
+            api=api,
+            account_id=account_id,
+            data_handler=handler,
+            account_balance=INITIAL_BALANCE,
+            tick_size=params['tick_size'],
+            spread=params['spread']
+        )
+
+        # Controller initialisieren (History & offene Orders)
+        strat.controller.initialize()
+
+        # Strategie-Loop starten (subscribe in data_handler)
+        strat.start()
+        strategies[sym] = strat
+
+    # Periodische Zusammenfassung aller Strategien
+    start_periodic_summary(strategies, interval=15)
+
+    # Event-Loop starten (blockierend)
+    handler.run()
