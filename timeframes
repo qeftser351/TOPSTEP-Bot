@@ -1,0 +1,134 @@
+"""
+Definition der Zeiteinheiten und Übergangsregeln für die Strategie.
+- k (Kontext-Zeiteinheit): 15min (900 Sekunden)
+- b (Bestätigungs-Zeiteinheit): 3min (180 Sekunden)
+- e (Einstiegs-Zeiteinheit): 15sec
+
+Bot-Start:
+- Starte in k und lade HISTORY_LIMIT[K] Kerzen, nimm deren Analyse-Resultat als initiale Phase.
+
+Wechsel:
+- Bei jedem Wechsel in eine neue TF rufe zum Zeitpunkt des Wechsels ebenfalls init_from_history() mit HISTORY_LIMIT[tf] an,
+  um die Phase in der neuen TF sofort zu bestimmen.
+
+Zeitreihen-Logik:
+- Wechsel k→b: wenn k in einer Base-Phase ist.
+- Wechsel b→e: wenn b in gleicher Grundrichtung wie k ist und in einer Base-Phase.
+- Rückkehr b→k: wenn k-Grundrichtung von der bei Wechsel eingehaltenen abweicht.
+- Rückkehr e→b: wenn b-Grundrichtung von der bei Wechsel eingehaltenen abweicht.
+"""
+from config.phase import Phase
+from core.types import Phase
+
+# Zeiträume in Sekunden (API-unabhängig, Aggregation im Bot)
+K = 900   # Kontext-Zeiteinheit: 15 Minuten
+B = 180   # Bestätigungs-Zeiteinheit: 3 Minuten
+E = 15    # Einstiegs-Zeiteinheit: 15 Sekunden
+
+TIMEFRAMES = [K, B, E]
+
+# Historische Bars zum Initialisieren in jeder TF
+HISTORY_LIMIT: dict[int, int] = {
+    K: 50,
+    B: 50,
+    E: 50,
+}
+
+# Als Base-Phase gelten alle Baseline-Zustände
+BASE_PHASES: set[Phase] = {
+    Phase.BASE_BULL,
+    Phase.BASE_SWITCH_BULL,
+    Phase.BASE_BEAR,
+    Phase.BASE_SWITCH_BEAR,
+}
+
+
+def get_direction(phase: Phase) -> str:
+    """
+    Gibt die Grundrichtung einer Phase zurück: 'bull' oder 'bear'.
+    """
+    name = phase.name.lower() if phase is not None else ''
+    if 'bull' in name:
+        return 'bull'
+    elif 'bear' in name:
+        return 'bear'
+    return ''
+
+
+def can_k_to_b(phase):
+    return phase in (
+        Phase.BASE_SWITCH_BULL, Phase.BASE_SWITCH_BEAR,
+        Phase.BASE_BULL, Phase.BASE_BEAR,
+        Phase.TREND_BULL, Phase.TREND_BEAR
+    )
+
+
+def can_b_to_e(phase_k, phase_b):
+    return (
+        phase_k in (Phase.BASE_BULL, Phase.BASE_BEAR, Phase.BASE_SWITCH_BULL, Phase.BASE_SWITCH_BEAR, Phase.TREND_BULL, Phase.TREND_BEAR)
+        and
+        phase_b in (Phase.BASE_BULL, Phase.BASE_BEAR, Phase.BASE_SWITCH_BULL, Phase.BASE_SWITCH_BEAR)
+        and
+        get_direction(phase_b) == get_direction(phase_k)
+    )
+
+
+def should_switch_back_to_k(phase_k: Phase, entered_direction: str) -> bool:
+    """
+    Während in b: zurück nach k,
+    sobald sich get_direction(k) von entered_direction unterscheidet.
+    """
+    if not entered_direction:
+        return False
+    return get_direction(phase_k) != entered_direction
+
+
+def should_switch_back_to_b(phase_b: Phase, entered_direction: str) -> bool:
+    """
+    Während in e: zurück nach b,
+    sobald sich get_direction(b) von entered_direction unterscheidet.
+    """
+    if not entered_direction:
+        return False
+    return get_direction(phase_b) != entered_direction
+
+
+def get_history_limit(tf: int) -> int:
+    """
+    Liefert die Anzahl Bars, die beim Wechsel in die TF
+    zum Initialisieren geladen werden sollten.
+    """
+    return HISTORY_LIMIT.get(tf, 50)
+
+
+# --- Aggregations-Utility für Custom-Kerzen (z. B. in deinem Datenhandler nutzen) ---
+
+import pandas as pd
+
+def aggregate_candles(candles: list[dict], timeframe_seconds: int) -> list[dict]:
+    if not candles:
+        return []
+
+    df = pd.DataFrame(candles)
+
+    # Wenn timestamp bereits ein String im ISO-Format ist:
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+
+    df.set_index('timestamp', inplace=True)
+
+    rule = f'{timeframe_seconds}S'
+    agg_dict = {
+        'open': 'first',
+        'high': 'max',
+        'low': 'min',
+        'close': 'last',
+        'volume': 'sum'
+    }
+    df_agg = df.resample(rule, label='right', closed='right').agg(agg_dict).dropna().reset_index()
+
+    # zurück zu int-ms, wenn downstream das erwartet
+    df_agg['timestamp'] = (df_agg['timestamp'].astype('int64') // 10**6)
+
+    return df_agg.to_dict(orient='records')
+
+
