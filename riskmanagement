@@ -1,0 +1,126 @@
+from typing import List, Optional
+from config.phase import Candle
+import math
+from projectx_api import ProjectXAPI
+
+class RiskManager:
+    def __init__(self, api: ProjectXAPI, account_balance: float, max_risk_per_trade: float = 0.01):
+        self.api = api
+        self.account_balance = account_balance
+        self.max_risk = max_risk_per_trade
+
+    def calculate_position_size(
+        self,
+        symbol: str,
+        entry_price: float,
+        stop_price: float
+    ) -> float:
+        risk_amount = self.account_balance * self.max_risk
+        stop_distance = abs(entry_price - stop_price)
+        raw_lots = risk_amount / stop_distance
+        return self.normalize_lots(symbol, raw_lots)
+
+    def normalize_lots(self, symbol: str, desired_lots: float) -> float:
+        # 1) Contract‐Details von der API holen
+        contract = self.api.get_contract_details(symbol)
+        # Je nach Feldnamen in deiner API‐Antwort:
+        min_vol, max_vol, step_vol = (
+            contract.get("minVolume", 0.01),
+            contract.get("maxVolume", 100.0),
+            contract.get("volumeStep", 0.01)
+        )
+        # 2) Runden auf nächstes gültiges Lot‐Schritt
+        lots = max(min_vol, step_vol * round(desired_lots / step_vol))
+        return min(lots, max_vol)
+
+
+    # ---------------------------
+    # Break-Even-Logik (Buy-Stop)
+    # ---------------------------
+    def is_go_candle_bullish(candle: Candle, entry_price: float) -> bool:
+        return candle.low <= entry_price and candle.close > entry_price
+
+    def calculate_breakeven_price_buy(self,
+                                  candles: List[Candle],
+                                  entry_price: float,
+                                  spread: float) -> Optional[float]:
+        """
+        Bestimmt das neue Stop-Loss-Level (Break-Even) nach Buy-Stop-Entry.
+
+        Ablauf:
+        1. Erkenne erste Go-Candle-Bullisch in der Historie.
+        2. Ab dieser Go-Candle für jede nachfolgende Kerze:
+           - Wenn c.low > entry_price und c.close > go_candle.high:
+             -> return entry_price - spread
+           - Wenn c erneut Go-Candle-Bullisch:
+             -> treat as neue Go-Candle und weitersuchen
+        3. Ansonsten: kein Breakeven-Trigger.
+        """
+        go_candle = None
+        # 1) Suche Go-Candle
+        for idx, c in enumerate(candles):
+            if self.is_go_candle_bullish(c, entry_price):
+                go_candle = c
+                go_index = idx
+                break
+        if go_candle is None:
+            return None
+
+        # 2) Prüfe nachfolgende Kerzen
+        for c in candles[go_index+1:]:
+            # Break-Even-Bedingung
+            if c.low > entry_price and c.close > go_candle.high:
+                return entry_price - spread
+            # Fallback: neue Go-Candle
+            if self.is_go_candle_bullish(c, entry_price):
+                go_candle = c
+        return None
+
+    # ---------------------------
+    # Break-Even-Logik für Sell-Stop
+    # ---------------------------
+    def is_go_candle_bearish(candle: Candle, entry_price: float) -> bool:
+        return candle.high >= entry_price and candle.close < entry_price
+
+    def calculate_breakeven_price_sell(self,
+                                       candles: List[Candle],
+                                       entry_price: float,
+                                       spread: float) -> Optional[float]:
+        """
+        Break-Even nach Sell-Stop-Entry:
+        1. Suche erste Go-Candle-Bärisch
+        2. Für jede nachfolgende Kerze:
+           - Wenn c.high < entry_price und c.close < go_candle.low: Stop auf entry_price + spread
+           - Wenn erneut Go-Candle-Bärisch: aktualisiere go_candle
+        """
+        go_candle: Optional[Candle] = None
+        go_index: int = -1
+        for idx, c in enumerate(candles):
+            if self.is_go_candle_bearish(c, entry_price):
+                go_candle = c
+                go_index = idx
+                break
+        if go_candle is None:
+            return None
+
+        for c in candles[go_index+1:]:
+            # Aktivierungs-Condition
+            if c.high < entry_price and c.close < go_candle.low:
+                return entry_price + spread
+            # Fallback: neue Go-Candle
+            if self.is_go_candle_bearish(c, entry_price):
+                go_candle = c
+        return None
+
+
+    # ---------------------------
+    # Trailing-Stop-Logik (RR-basiert, intrabar-aktiv)
+    # ---------------------------
+    def trailing_step_buy(self, entry_price: float, rr: float, level: int) -> float:
+        # Für Buy: ziehe ab Level 3RR auf 1RR nach, ab 4RR auf 2RR, usw.
+        return entry_price + (level - 2) * rr
+
+
+    def trailing_step_sell(self, entry_price: float, rr: float, level: int) -> float:
+        return entry_price - (level - 2) * rr
+
