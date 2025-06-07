@@ -1,0 +1,518 @@
+from core.types import Candle, Phase, PhaseRule, ContextStore
+from typing import List, Callable
+from datetime import datetime
+import pandas as pd
+from typing import List, Optional
+from core.types import Phase, Candle
+
+
+
+
+# —————— Konstanten und Hilfsfunktionen ——————
+EMA_FAST_PERIOD = 10
+EMA_SLOW_PERIOD = 20
+EMA_SOURCE      = 'close'
+
+def _ema(series: pd.Series, period: int) -> float:
+    """
+    Klassischer EMA ohne Offset (adjust=False), auf Basis der Schlusskurse.
+    """
+    return series.ewm(span=period, adjust=False).mean().iloc[-1]
+
+# Hilfsfunktion für bedingungslose Übergänge
+def always_true(prev_phase: Phase,
+                candles: List[Candle],
+                context: ContextStore) -> bool:
+    # Kontext wird nicht genutzt, muss aber übergeben werden
+    return True
+
+# Confirmation-Candle Logik
+def is_confirmation_bullish(
+    prev_phase: Phase,
+    context: ContextStore,
+    candles: list = None  # Standardmäßig None, dann Context verwenden
+) -> bool:
+    if candles is None:
+        candles = context.get('last_candles', [])
+    # 1) Mindestens 2 Kerzen nötig
+    if len(candles) < 2:
+        return False
+
+    curr, prev = candles[-1], candles[-2]
+
+    # 3) Darf kein neues Hoch machen
+    if curr.high > prev.high:
+        return False
+
+    # 4) Jetzt EMAs berechnen
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
+    ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
+
+    # 5) Wähle die EMA-Referenz, die weiter weg ist
+    dist_fast = abs(curr.close - ema_fast)
+    dist_slow = abs(curr.close - ema_slow)
+    ema_ref   = ema_fast if dist_fast > dist_slow else ema_slow
+
+    # 6) Abschluss über dieser EMA
+    return curr.close > ema_ref
+
+
+def is_confirmation_bearish(
+    prev_phase: Phase,
+    context: ContextStore,
+    candles: list = None  # Standardmäßig None, dann Context verwenden
+) -> bool:
+    if candles is None:
+        candles = context.get('last_candles', [])
+    if len(candles) < 2:
+        return False
+
+    curr, prev = candles[-1], candles[-2]
+
+    # 3) Darf kein neues Tief unter das vorherige machen
+    if curr.low < prev.low:
+        return False
+
+    # 4) EMAs berechnen
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
+    ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
+
+    # 5) Wähle die EMA-Referenz, die weiter weg ist
+    dist_fast = abs(curr.close - ema_fast)
+    dist_slow = abs(curr.close - ema_slow)
+    ema_ref   = ema_fast if dist_fast > dist_slow else ema_slow
+
+    # 6) Abschluss < EMA-Referenz
+    return curr.close < ema_ref
+
+#1. Switch_Bull
+def is_switch_bull(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    allowed = {
+        Phase.BASE_SWITCH_BEAR,
+        Phase.SWITCH_BEAR,
+        Phase.TREND_BEAR,
+        Phase.BASE_BEAR
+    }
+    if prev_phase not in allowed or len(candles) < 2:
+        return False
+
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df[EMA_SOURCE], EMA_FAST_PERIOD)
+    ema_slow = _ema(df[EMA_SOURCE], EMA_SLOW_PERIOD)
+
+    curr_idx = len(candles) - 1
+    prev_idx = curr_idx - 1
+
+    prev = candles[prev_idx]
+    curr = candles[curr_idx]
+
+    # 1) Prüfe die drei Signal-Pattern für Bull-Switch
+    breakout = False
+    if curr.close > ema_fast and curr.close > ema_slow:
+        breakout = True
+    elif prev.close > ema_fast and curr.close > ema_slow:
+        breakout = True
+    elif prev.close > ema_slow and curr.close > ema_fast:
+        breakout = True
+
+    if not breakout:
+        return False
+
+    # --- initial_low: aktuelle Kerze zuerst prüfen, dann rückwärts ---
+    initial_low_idx = None
+    for i in range(curr_idx, 0, -1):
+        # Ein lokales Tief: low[i] < low[i-1]
+        if candles[i].low < candles[i-1].low:
+            initial_low_idx = i
+            break
+
+    if initial_low_idx is None:
+        # Falls kein Tief gefunden wurde, kann kein Switch stattfinden
+        return False
+
+    initial_low = candles[initial_low_idx].low
+
+    # --- prev_higher_high: suche von initial_low_idx-1 rückwärts nach einem höheren Hoch ---
+    prev_higher_high = None
+    for i in range(initial_low_idx - 1, -1, -1):
+        if candles[i].high > initial_low:
+            prev_higher_high = candles[i].high
+            break
+
+    if prev_higher_high is None:
+        return False
+
+    # Context füllen
+    context['switch_bull_initial_low']      = initial_low
+    context['switch_bull_prev_higher_high'] = prev_higher_high
+    return True
+
+
+#2. Switch_Bear
+def is_switch_bear(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    allowed = {
+        Phase.BASE_SWITCH_BULL,
+        Phase.SWITCH_BULL,
+        Phase.TREND_BULL,
+        Phase.BASE_BULL
+    }
+    if prev_phase not in allowed or len(candles) < 2:
+        return False
+
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df[EMA_SOURCE], EMA_FAST_PERIOD)
+    ema_slow = _ema(df[EMA_SOURCE], EMA_SLOW_PERIOD)
+
+    curr_idx = len(candles) - 1
+    prev_idx = curr_idx - 1
+
+    prev = candles[prev_idx]
+    curr = candles[curr_idx]
+
+    # Prüfe die drei Bear-Switch-Breakout-Pattern
+    breakout = False
+    if curr.close < ema_fast and curr.close < ema_slow:
+        breakout = True
+    elif prev.close < ema_fast and curr.close < ema_slow:
+        breakout = True
+    elif prev.close < ema_slow and curr.close < ema_fast:
+        breakout = True
+
+    if not breakout:
+        return False
+
+    # --- initial_high: aktuelle Kerze zuerst prüfen, dann rückwärts ---
+    initial_high_idx = None
+    for i in range(curr_idx, 0, -1):
+        # Ein lokaler Peak: high[i] > high[i-1]
+        if candles[i].high > candles[i-1].high:
+            initial_high_idx = i
+            break
+
+    if initial_high_idx is None:
+        return False
+
+    initial_high = candles[initial_high_idx].high
+
+    # --- prev_lower_low: suche von initial_high_idx-1 rückwärts nach einem tieferen Low ---
+    prev_lower_low = None
+    peak_low = candles[initial_high_idx].low
+    for i in range(initial_high_idx - 1, -1, -1):
+        if candles[i].low < peak_low:
+            prev_lower_low = candles[i].low
+            break
+
+    if prev_lower_low is None:
+        return False
+
+    context['switch_bear_initial_high']   = initial_high
+    context['switch_bear_prev_lower_low'] = prev_lower_low
+    return True
+
+
+# 3. Trend_Bull
+def is_trend_bull(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    allowed = {Phase.BASE_SWITCH_BULL, Phase.BASE_BULL}
+    if prev_phase not in allowed or len(candles) < 3:
+        return False
+
+    if 'trend_bull_initial_high' not in context and is_confirmation_bullish(prev_phase, context, candles[:-1]):
+        context['trend_bull_initial_high'] = candles[-2].high
+
+    initial_high = context.get('trend_bull_initial_high')
+    if initial_high is None:
+        return False
+
+    curr = candles[-1]
+    if curr.close > initial_high:
+        return True
+    return False
+
+
+
+# 4. Trend_Bear
+def is_trend_bear(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    allowed = {Phase.BASE_SWITCH_BEAR, Phase.BASE_BEAR}
+    if prev_phase not in allowed or len(candles) < 3:
+        return False
+
+    # KORREKTUR: Jedes Mal prüfen, ob die letzte abgeschlossene Candle eine Confirmation-Bear ist
+    if 'trend_bear_initial_low' not in context and is_confirmation_bearish(prev_phase, context, candles[:-1]):
+        context['trend_bear_initial_low'] = candles[-2].low
+
+    initial_low = context.get('trend_bear_initial_low')
+    if initial_low is None:
+        return False
+
+    curr = candles[-1]
+    if curr.close < initial_low:
+        return True
+    return False
+
+
+
+# 5. Base_Bull
+def is_base_bull(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    if prev_phase != Phase.TREND_BULL:
+        return False
+    return is_confirmation_bullish(prev_phase, context, candles)
+
+
+# 6. Base_Bear
+def is_base_bear(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    if prev_phase != Phase.TREND_BEAR:
+        return False
+    return is_confirmation_bearish(prev_phase, context, candles)
+
+
+# 7. Base_Switch_Bull
+def is_base_switch_bull(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    # Nur relevant, wenn wir gerade in SWITCH_BULL sind
+    if prev_phase != Phase.SWITCH_BULL:
+        return False
+
+    initial_low = context.get('switch_bull_initial_low')
+    prev_higher = context.get('switch_bull_prev_higher_high')
+    if initial_low is None or prev_higher is None:
+        return False
+
+    # 1) Pivot-Index finden
+    pivot_idx = next(
+        (i for i, c in enumerate(candles) if c.low == initial_low),
+        None
+    )
+    if pivot_idx is None:
+        return False
+
+    # 2) Breakout-Index: erste Kerze nach pivot mit close > prev_higher
+    breakout_idx = None
+    for i in range(pivot_idx + 1, len(candles)):
+        if candles[i].close > prev_higher:
+            breakout_idx = i
+            break
+    if breakout_idx is None:
+        return False
+
+    # 3) Confirmation-Loop startet **direkt** bei breakout_idx + 1
+    start_confirmation = breakout_idx + 1
+    if start_confirmation >= len(candles):
+        return False
+
+    for j in range(start_confirmation, len(candles)):
+        if is_confirmation_bullish(prev_phase, context, candles[: j + 1 ]):
+            return True
+
+    return False
+
+
+
+
+#8. Base_Switch_Bear#
+def is_base_switch_bear(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    # Nur relevant, wenn wir gerade in SWITCH_BEAR sind
+    if prev_phase != Phase.SWITCH_BEAR:
+        return False
+
+    initial_high = context.get('switch_bear_initial_high')
+    prev_lower   = context.get('switch_bear_prev_lower_low')
+    if initial_high is None or prev_lower is None:
+        return False
+
+    # 1) Pivot-Index finden
+    pivot_idx = next((i for i, c in enumerate(candles) if c.high == initial_high), None)
+    if pivot_idx is None:
+        return False
+
+    # 2) Breakdown-Index: erste Kerze nach pivot mit close < prev_lower
+    breakdown_idx = None
+    for i in range(pivot_idx + 1, len(candles)):
+        if candles[i].close < prev_lower:
+            breakdown_idx = i
+            break
+    if breakdown_idx is None:
+        return False
+
+    # 3) Confirmation-Loop startet **direkt** bei breakdown_idx + 1
+    start_confirmation = breakdown_idx + 1
+    if start_confirmation >= len(candles):
+        return False
+
+    for j in range(start_confirmation, len(candles)):
+        if is_confirmation_bearish(prev_phase, context, candles[: j + 1 ]):
+            return True
+
+    return False
+
+
+#9. Neutral zu switch_bull
+def neutral_to_switch_bull(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    # NUR aus NEUTRAL starten!
+    if prev_phase != Phase.NEUTRAL or len(candles) < 3:
+        return False
+
+    # EMAs berechnen
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df[EMA_SOURCE], EMA_FAST_PERIOD)
+    ema_slow = _ema(df[EMA_SOURCE], EMA_SLOW_PERIOD)
+
+    curr_idx = len(candles) - 1
+    prev_idx = curr_idx - 1
+
+    prev = candles[prev_idx]
+    curr = candles[curr_idx]
+
+    # Prüfe die drei Signal-Pattern für Bull-Switch
+    breakout = False
+    # a) Einzelne Kerze schließt über beiden EMAs
+    if curr.close > ema_fast and curr.close > ema_slow:
+        breakout = True
+    # b) Fast→Slow Crossover
+    elif prev.close > ema_fast and curr.close > ema_slow:
+        breakout = True
+    # c) Slow→Fast Crossover
+    elif prev.close > ema_slow and curr.close > ema_fast:
+        breakout = True
+
+    if not breakout:
+        return False
+
+    # initial_low ermitteln: letzten lokalen Tiefpunkt vor curr finden
+    initial_low_idx = None
+    for i in range(curr_idx - 1, 0, -1):
+        if candles[i].low > candles[i-1].low:
+            initial_low_idx = i - 1
+            break
+
+    if initial_low_idx is None:
+        return False
+
+    initial_low = candles[initial_low_idx].low
+
+    # --- prev_higher_high ermitteln: erstes Hoch nach initial_low_idx, das höher ist ---
+    prev_higher_high = None
+    for i in range(initial_low_idx-1, -1, -1):
+        if candles[i].high > initial_low:
+            prev_higher_high = candles[i].high
+            break
+
+    if prev_higher_high is None:
+        return False
+
+    # Context füllen
+    context['switch_bull_initial_low']      = initial_low
+    context['switch_bull_prev_higher_high'] = prev_higher_high
+    return True
+
+
+#10. neutral zu switch_bear
+def neutral_to_switch_bear(prev_phase: Phase, context: ContextStore) -> bool:
+    candles = context.get('last_candles', [])
+    # NUR aus NEUTRAL starten!
+    if prev_phase != Phase.NEUTRAL or len(candles) < 3:
+        return False
+
+    # EMAs berechnen
+    df       = pd.DataFrame([c._asdict() for c in candles])
+    ema_fast = _ema(df[EMA_SOURCE], EMA_FAST_PERIOD)
+    ema_slow = _ema(df[EMA_SOURCE], EMA_SLOW_PERIOD)
+
+    curr_idx = len(candles) - 1
+    prev_idx = curr_idx - 1
+
+    prev = candles[prev_idx]
+    curr = candles[curr_idx]
+
+    # Drei Break-Pattern wie gehabt
+    breakout = False
+    if curr.close < ema_fast and curr.close < ema_slow:
+        breakout = True
+    elif prev.close < ema_fast and curr.close < ema_slow:
+        breakout = True
+    elif prev.close < ema_slow and curr.close < ema_fast:
+        breakout = True
+
+    if not breakout:
+        return False
+
+    # initial_high dynamisch ermitteln: letzter lokaler Peak vor curr
+    initial_high_idx = None
+    for i in range(curr_idx - 1, 0, -1):
+        if candles[i].high < candles[i - 1].high:
+            initial_high_idx = i - 1
+            break
+
+    if initial_high_idx is None:
+        return False
+
+    initial_high = candles[initial_high_idx].high
+
+    # --- und das erste Tief nach diesem Peak, das tiefer ist als dessen low ---
+    prev_lower_low = None
+    peak_low = candles[initial_high_idx].low
+    for i in range(initial_high_idx-1, -1, -1):
+        if candles[i].low < peak_low:
+            prev_lower_low = candles[i].low
+            break
+
+    if prev_lower_low is None:
+        return False
+
+    # Context füllen
+    context['switch_bear_initial_high']   = initial_high
+    context['switch_bear_prev_lower_low'] = prev_lower_low
+    return True
+
+
+
+
+
+# Liste aller Phasen-Regeln für den Wechsel von Phase nach Phase
+PHASE_RULES: List[PhaseRule] = [
+    # Unconditional transitions from NEUTRAL to any phase
+    PhaseRule(Phase.NEUTRAL, Phase.SWITCH_BULL, neutral_to_switch_bull),
+    PhaseRule(Phase.NEUTRAL, Phase.SWITCH_BEAR, neutral_to_switch_bear),
+
+
+    # Switch_Bull
+    PhaseRule(Phase.BASE_SWITCH_BEAR, Phase.SWITCH_BULL, is_switch_bull),
+    PhaseRule(Phase.SWITCH_BEAR,      Phase.SWITCH_BULL, is_switch_bull),
+    PhaseRule(Phase.TREND_BEAR,       Phase.SWITCH_BULL, is_switch_bull),
+    PhaseRule(Phase.BASE_BEAR,        Phase.SWITCH_BULL, is_switch_bull),
+
+    # Switch_Bear
+    PhaseRule(Phase.BASE_SWITCH_BULL, Phase.SWITCH_BEAR, is_switch_bear),
+    PhaseRule(Phase.SWITCH_BULL,      Phase.SWITCH_BEAR, is_switch_bear),
+    PhaseRule(Phase.TREND_BULL,       Phase.SWITCH_BEAR, is_switch_bear),
+    PhaseRule(Phase.BASE_BULL,        Phase.SWITCH_BEAR, is_switch_bear),
+
+    # Trend_Bull
+    PhaseRule(Phase.BASE_SWITCH_BULL, Phase.TREND_BULL, is_trend_bull),
+    PhaseRule(Phase.BASE_BULL,        Phase.TREND_BULL, is_trend_bull),
+
+    # Trend_Bear
+    PhaseRule(Phase.BASE_SWITCH_BEAR, Phase.TREND_BEAR, is_trend_bear),
+    PhaseRule(Phase.BASE_BEAR,        Phase.TREND_BEAR, is_trend_bear),
+
+    # Base_Bull
+    PhaseRule(Phase.TREND_BULL, Phase.BASE_BULL, is_base_bull),
+
+    # Base_Bear
+    PhaseRule(Phase.TREND_BEAR, Phase.BASE_BEAR, is_base_bear),
+
+    # Base_Switch_Bull
+    PhaseRule(Phase.SWITCH_BULL,     Phase.BASE_SWITCH_BULL, is_base_switch_bull),
+
+    # Base_Switch_Bear
+    PhaseRule(Phase.SWITCH_BEAR,     Phase.BASE_SWITCH_BEAR, is_base_switch_bear)
+]
