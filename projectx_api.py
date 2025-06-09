@@ -151,26 +151,31 @@ class ProjectXAPI:
             "Content-Type": "application/json"
         }
 
-        if end_time is None:
-            end_time = datetime.utcnow()
-        if start_time is None:
-            start_time = end_time - timedelta(days=5)
-
         payload = {
-            "contractId": contract_id,
-            "unit": unit,
-            "unitNumber": unit_number,
-            "limit": limit,
-            "live": live,
+            "contractId":     contract_id,
+            "unit":           unit,
+            "unitNumber":     unit_number,
+            "limit":          limit,
+            "live":           live,
             "includePartialBar": include_partial_bar,
-            "startTime": start_time.isoformat() + "Z",
-            "endTime": end_time.isoformat() + "Z"
         }
+
+        if not live:
+            # nur bei historischen Abfragen mit Zeitfenster
+            if end_time is None:
+                end_time = datetime.utcnow()
+            if start_time is None:
+                start_time = end_time - timedelta(days=5)
+            payload["startTime"] = start_time.isoformat() + "Z"
+            payload["endTime"]   = end_time.isoformat() + "Z"
 
         print("→ Request an API:", json.dumps(payload, indent=2))
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
         return response.json().get("bars", [])
+
+
+
 
     #Live-Kerzen abholen
     @ensure_token
@@ -180,19 +185,17 @@ class ProjectXAPI:
         unit: int,
         unit_number: int,
     ) -> Optional[dict]:
-        """
-        Liefert die jeweils letzte abgeschlossene Bar 
-        im Live-Modus (z.B. für 15-Sekunden-Bars).
-        """
         bars = self.get_candles(
             contract_id=contract_id,
             unit=unit,
             unit_number=unit_number,
-            limit=1,                   # nur die letzte Kerze
-            live=True,                 # Live-Modus
-            include_partial_bar=False  # keine unvollständige Bar
+            limit=1,
+            live=True,
+            include_partial_bar=False
         )
         return bars[0] if bars else None
+
+
 
 
 
