@@ -150,23 +150,27 @@ class MultiTimeframeController:
 
         # Lade History & Phasen
         MIN_CANDLES = 10
-        for tf in (K, B, E):
-            raw = self.fetch_history(self.symbol, tf, get_history_limit(tf))
+        for tf in (E, B, K):
+            raw = self.data.fetch_history(self.symbol, tf, get_history_limit(tf))
             hist = raw[:-1]
-
-            if not hist or len(hist) < MIN_CANDLES:
-                print(f"[INIT] Zu wenig Kerzen für TF={tf}, setze Phase auf UNKNOWN")
-                self.history[tf] = hist
-                self.phases[tf] = Phase.UNKNOWN  # <-- explizit setzen
-                continue
-
             fsm = self.machines[tf]
             fsm.reset()
             fsm.context['last_candles'] = hist
             phase = fsm.replay_from_scratch(hist)
-
             self.history[tf] = hist
             self.phases[tf] = phase
+            
+            ctx = fsm.context
+            if phase in (Phase.BASE_SWITCH_BULL, Phase.SWITCH_BULL):
+                self.switch_data[tf] = {
+                    'initial_extreme':  ctx.get('switch_bull_initial_low'),
+                    'previous_extreme': ctx.get('switch_bull_prev_higher_high')
+                }
+            elif phase in (Phase.BASE_SWITCH_BEAR, Phase.SWITCH_BEAR):
+                self.switch_data[tf] = {
+                    'initial_extreme':  ctx.get('switch_bear_initial_high'),
+                    'previous_extreme': ctx.get('switch_bear_prev_lower_low')
+                }
 
         # Übernehme offene Pending-Orders API-RDY
         for order in self.api.get_open_orders(self.account_id):
@@ -193,8 +197,8 @@ class MultiTimeframeController:
                 self.risk_mgr.trailing_levels[self.open_ticket] = 0
                 print(f"[INIT] Übernehme Position {pos['positionId']}: Entry-Time={entry_ts}, Price={self.entry_price}, SL={self.initial_stop}")
 
-        print(f"[INIT DEBUG] entry_timestamps nach initialize: {self.entry_timestamps}")
-        print(f"[INIT DEBUG] entry_price={self.entry_price}, initial_stop={self.initial_stop}")
+            print(f"[INIT DEBUG] entry_timestamps nach initialize: {self.entry_timestamps}")
+            print(f"[INIT DEBUG] entry_price={self.entry_price}, initial_stop={self.initial_stop}")
 
         # Initialer Phasenwechsel
         if can_k_to_b(self.phases[K]):
@@ -211,6 +215,9 @@ class MultiTimeframeController:
             self._switch_to(E)
 
         self._sync_ticket_state_with_api()
+        
+        print("[INIT] initialize() abgeschlossen – erste Zusammenfassung:")
+        self.print_summary()
     
     #API-RDY
     def fetch_history(self, symbol: str, tf_seconds: int, limit: int) -> list[Candle]:
@@ -221,7 +228,7 @@ class MultiTimeframeController:
 
         print("[DEBUG] API-Aufruf:", {
             "contract_id": symbol,
-            "unit": 4,
+            "unit": 1,
             "unit_number": 15,
             "limit": limit * (tf_seconds // 15),
             "start_time": start_time.isoformat() + "Z",
@@ -230,7 +237,7 @@ class MultiTimeframeController:
 
         raw = self.api.get_candles(
             contract_id=symbol,
-            unit=4,              # Sekunden
+            unit=1,              # 1=Sekunden
             unit_number=15,      # 15 Sekunden
             limit=limit * (tf_seconds // 15),
             live=False,
@@ -852,15 +859,6 @@ class MultiTimeframeController:
         phase_3m = self.phases.get(B).name if self.phases.get(B) else ""
         phase_15s = self.phases.get(E).name if self.phases.get(E) else ""
         log_summary_to_csv(self.symbol, phase_15m, phase_3m, phase_15s, entry, sl, rr)
-
-    def dump_h1_history(self, n=15):
-        import json           # <--- Das MUSS in die Funktion oder ganz oben ins File!
-        from datetime import datetime
-        def convert(o):
-            if isinstance(o, datetime):
-                return o.isoformat()
-            return str(o)
-        print(json.dumps([c._asdict() for c in self.history[K][-n:]], indent=2, default=convert))
 
 
     def stop(self) -> None:
