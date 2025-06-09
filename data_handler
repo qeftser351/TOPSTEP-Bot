@@ -12,6 +12,7 @@ from projectx_api import ProjectXAPI
 from datetime import datetime, timedelta
 import pandas as pd
 from config.timeframes import aggregate_candles
+from requests.exceptions import HTTPError
 
 
 
@@ -45,7 +46,7 @@ class DataHandler:
         # 2) Rohdaten vom Server (15s-Bars) holen
         raw = self.api.get_candles(
             contract_id=symbol,
-            unit=4,                 # 4 = Sekunden
+            unit=1,                 # 1 = Sekunden
             unit_number=15,         # 15s-Bars
             limit=limit * (timeframe // 15),
             live=False,
@@ -241,37 +242,39 @@ class DataHandler:
             print(f"[ERROR] API update_position_stop gescheitert: {e}")
             return None
 
+
+
     def run(self):
         self._running = True
         while self._running:
             for symbol, tfs in self.subscribers.items():
-                # 1) hole immer nur die letzte abgeschlossene 15-Sekunden-Bar
-                latest_raw = self.api.get_latest_candle(
-                    contract_id=symbol,
-                    unit=4,            # Sekunden
-                    unit_number=15     # 15-Sekunden-Bars
-                )
-                if not latest_raw:
+                try:
+                    latest_raw = self.api.get_latest_candle(
+                        contract_id=symbol,
+                        unit=1,           # Sekunden
+                        unit_number=15    # 15-Sekunden-Bars
+                    )
+                except HTTPError:
+                    print("→ Keine Live-Kerzen (Sonntag/Markt geschlossen). Ich warte 30 s…")
+                    time.sleep(30)
                     continue
 
-                # 2) für jeden abonnierten TF aggregieren und verarbeiten
+                if not latest_raw:
+                    print("→ Keine Live-Kerzen (Sonntag/Markt geschlossen). Ich warte 30 s…")
+                    time.sleep(30)
+                    continue
+
                 for tf, callbacks in tfs.items():
-                    # aggregate_candles erwartet eine Liste von Roh-Bars
                     agg = aggregate_candles([latest_raw], tf)
                     if not agg:
                         continue
-
-                    # wir haben genau eine neue aggregierte Kerze
                     item = agg[0]
                     ts = datetime.utcfromtimestamp(item["timestamp"] / 1000)
-
-                    # 3) schon verarbeitet? → überspringen
                     prev = self.last_history_ts.setdefault(symbol, {}).get(tf)
                     if prev is not None and ts <= prev:
                         continue
-
-                    #4) Timestamp merken, Candle bauen, FSM updaten
                     self.last_history_ts[symbol][tf] = ts
+
                     candle = Candle(
                         timestamp=ts,
                         open=item["open"],
@@ -282,10 +285,10 @@ class DataHandler:
                     )
                     self.histories.setdefault(symbol, {}).setdefault(tf, []).append(candle)
                     _ = self.phase_machine.update(self.histories[symbol][tf])
-
-                    # 5) Callback feuern
                     for cb in callbacks:
                         cb(candle)
 
             time.sleep(1)
+
+
 
