@@ -34,8 +34,11 @@ class DataHandler:
         self.open_ticket: Optional[int] = None
         self._pending_to_position: Dict[str, Dict[int, int]] = {}
         self.last_history_ts: Dict[str, Dict[int, Optional[datetime]]] = {}
+        self.contract_details_cache: Dict[str, dict] = {}
+        self.contract_name_cache: Dict[str, str] = {}
 
-    def fetch_history(self, symbol: str, timeframe: int, limit: int) -> List[Candle]:
+
+    def fetch_history(self, contract_id: str, timeframe: int, limit: int) -> List[Candle]:
         """
         Holt historische Kerzen im kleinsten TF (15s) und aggregiert auf den gewünschten timeframe (in Sekunden).
         """
@@ -45,7 +48,7 @@ class DataHandler:
 
         # 2) Rohdaten vom Server (15s-Bars) holen
         raw = self.api.get_candles(
-            contract_id=symbol,
+            contract_id=contract_id,
             unit=1,                 # 1 = Sekunden
             unit_number=15,         # 15s-Bars
             limit=limit * (timeframe // 15),
@@ -84,8 +87,8 @@ class DataHandler:
             ))
 
         # 6) Optional: Cache + Rückgabe
-        self.histories.setdefault(symbol, {})[timeframe] = candles.copy()
-        self.last_history_ts.setdefault(symbol, {})[timeframe] = candles[-1].timestamp if candles else None
+        self.histories.setdefault(contract_id, {})[timeframe] = candles.copy()
+        self.last_history_ts.setdefault(contract_id, {})[timeframe] = candles[-1].timestamp if candles else None
 
         return candles
 
@@ -132,147 +135,87 @@ class DataHandler:
 
         if callback not in subs[timeframe]:
             subs[timeframe].append(callback)
-            print(f"[DEBUG] Subscriber registriert: Symbol={symbol}, TF={timeframe}, CB={callback}")
+
+
+    def get_symbol_info(self, contract_id: str) -> SimpleNamespace:
+        # Cache Contract-Details
+        if contract_id not in self.contract_details_cache:
+            contract = self.api.get_contract_details_by_id(contract_id)
+            if not contract or "name" not in contract:
+                raise RuntimeError(f"Contract-Details oder Name fehlen für {contract_id}")
+            self.contract_details_cache[contract_id] = contract
+            self.contract_name_cache[contract_id] = contract["name"]
         else:
-            print(f"[DEBUG] Subscriber bereits vorhanden: Symbol={symbol}, TF={timeframe}, CB={callback}")
+            contract = self.contract_details_cache[contract_id]
 
-    def get_symbol_info(self, symbol: str) -> SimpleNamespace:
-        contract = self.api.get_contract(symbol)
-        if not contract:
-            raise RuntimeError(f"API: Contract-Details nicht verfügbar für {symbol}")
-
-        quote    = self.api.get_quote(contract_id=symbol)
+        symbol_name = contract.get("name")
+        quote = self.api.get_quote(symbol_name)  # symbolischer Name als Parameter
         if not quote:
-            raise RuntimeError(f"API: Quote nicht verfügbar für {symbol}")
+            raise RuntimeError(f"API: Quote nicht verfügbar für Symbol {symbol_name}")
 
         return SimpleNamespace(
             bid=quote.get("bid"),
             ask=quote.get("ask"),
             stop_level=contract.get("tradeStopsLevel", 0),
-            tick_size  = contract.get("tickSize", 0.0)
+            tick_size=contract.get("tickSize", 0.0)
         )
 
-    def place_order(
-        self,
-        symbol: str,
-        side: str,
-        price: float,
-        size: float,
-        stop_loss: float
-    ):
-        # 1) Contract-Details holen, um Tick-Size & Min/Max-Volumen zu kennen
-        contract = self.api.get_contract(symbol)
-        if not contract:
-            print(f"[ERROR] Contract-Details für {symbol} nicht verfügbar")
-            return None
 
-        tick_size = contract.get("tickSize", None)
-        if tick_size is None or tick_size <= 0:
-            print(f"[ERROR] Ungültige Tick-Größe für {symbol}")
-            return None
 
-        # 2) Preis und Stop-Loss auf gültige Ticks runden
-        rounded_price = round(price / tick_size) * tick_size
 
-        # 3) Volumen innerhalb erlaubter Range runden
-        min_vol = contract.get("minVolume", 0.01)
-        max_vol = contract.get("maxVolume", 100.0)
-        step_vol = contract.get("volumeStep", 0.01)
-        adj_size = max(min(size, max_vol), min_vol)
-        adj_size = math.floor(adj_size / step_vol) * step_vol
 
-        # 4) Order per API senden
-        try:
-            res = self.api.place_order(
-                account_id=self.account_id,
-                contract_id=symbol,
-                order_type="STOP",
-                side=side,
-                size=adj_size,
-                stop_price=stop_loss,
-                price=price,
-                custom_tag="234000"
-            )
-            print(f"[INFO] place_order → {res}")
-            return res
-        except Exception as e:
-            print(f"[ERROR] API place_order gescheitert: {e}")
-            return None
-
-    def cancel_order(self, ticket: int):
-        try:
-            res = self.api.cancel_order(order_id=ticket)
-            print(f"[INFO] cancel_order → {res}")
-            return res
-        except Exception as e:
-            print(f"[ERROR] API cancel_order gescheitert: {e}")
-            return None
         
     def subscribe_candles(self, contract_id: str, timeframe: int, callback: Callable):
         self.subscribe(symbol=contract_id, timeframe=timeframe, callback=callback)
 
 
-    # Go-Candle Detection (unverändert)
-    def is_go_candle_bullish(candle: Candle, entry_price: float) -> bool:
-        return candle.low <= entry_price and candle.close > entry_price
-
-    def is_go_candle_bearish(candle: Candle, entry_price: float) -> bool:
-        return candle.high >= entry_price and candle.close < entry_price
-
-    def modify_order(
-        self,
-        symbol: str,
-        ticket: int,
-        new_sl: float,
-        new_tp: float = 0.0
-    ):
-        # 1) Mapping: Falls vorhanden, mappe Pending-Ticket → Position-Ticket
-        position_id = self._pending_to_position.get(symbol, {}).get(ticket, ticket)
-
-        # 2) Stop/TP per API updaten
-        try:
-            res = self.api.update_position_stop(
-                position_id=position_id,
-                stop_loss=new_sl,
-                take_profit=new_tp
-            )
-            print(f"[INFO] modify_order → {res}")
-            return res
-        except Exception as e:
-            print(f"[ERROR] API update_position_stop gescheitert: {e}")
-            return None
-
-
-
     def run(self):
         self._running = True
+        last_processed_second = -1  # verhindert Mehrfachverarbeitung
+
         while self._running:
-            for symbol, tfs in self.subscribers.items():
+            now = datetime.utcnow()
+
+            # Taktprüfung: exakt bei :00/:15/:30/:45 (±300ms Toleranz)
+            if now.second % 15 != 0 or now.microsecond > 300_000:
+                time.sleep(0.1)
+                continue
+
+            # sicherstellen, dass derselbe Zeitpunkt nicht doppelt verarbeitet wird
+            if now.second == last_processed_second:
+                time.sleep(0.1)
+                continue
+
+            last_processed_second = now.second
+
+            for symbol, tfs in list(self.subscribers.items()):
                 try:
                     latest_raw = self.api.get_latest_candle(
                         contract_id=symbol,
-                        unit=1,           # Sekunden
-                        unit_number=15    # 15-Sekunden-Bars
+                        unit=1,
+                        unit_number=15
                     )
-                except HTTPError:
-                    print("→ Keine Live-Kerzen (Sonntag/Markt geschlossen). Ich warte 30 s…")
-                    time.sleep(30)
+                except HTTPError as e:
+                    print(f"[LIVE DEBUG] HTTPError bei {symbol}: {e.response.status_code} – {e.response.text}")
                     continue
 
                 if not latest_raw:
-                    print("→ Keine Live-Kerzen (Sonntag/Markt geschlossen). Ich warte 30 s…")
-                    time.sleep(30)
+                    print(f"[LIVE DEBUG] Keine Daten empfangen für {symbol}")
                     continue
 
                 for tf, callbacks in tfs.items():
-                    agg = aggregate_candles([latest_raw], tf)
-                    if not agg:
+                    aggregated = aggregate_candles([latest_raw], tf)
+                    if not aggregated:
                         continue
-                    item = agg[0]
+
+                    item = aggregated[0]
                     ts = datetime.utcfromtimestamp(item["timestamp"] / 1000)
-                    prev = self.last_history_ts.setdefault(symbol, {}).get(tf)
-                    if prev is not None and ts <= prev:
-                        continue
+                    prev_ts = self.last_history_ts.setdefault(symbol, {}).get(tf)
+                    print(f"[DEBUG] Vergleiche Timestamps für {symbol}/{tf}: ts={ts}, prev_ts={prev_ts}")
+                    if prev_ts is not None and ts <= prev_ts:
+                        continue  # keine neue Kerze
+
+                    print(f"[LIVE DEBUG] Neue Kerze für {symbol}/{tf} @ {ts}")
                     self.last_history_ts[symbol][tf] = ts
 
                     candle = Candle(
@@ -283,12 +226,17 @@ class DataHandler:
                         close=item["close"],
                         volume=item["volume"]
                     )
+
+                    limit = get_history_limit(tf)
                     self.histories.setdefault(symbol, {}).setdefault(tf, []).append(candle)
+                    self.histories[symbol][tf] = self.histories[symbol][tf][-limit:]
+
                     _ = self.phase_machine.update(self.histories[symbol][tf])
                     for cb in callbacks:
                         cb(candle)
 
-            time.sleep(1)
+            time.sleep(0.1)  # kurze Pause, um CPU zu schonen
+
 
 
 
