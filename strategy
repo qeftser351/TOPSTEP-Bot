@@ -5,42 +5,39 @@ from projectx_api import ProjectXAPI
 from datetime import datetime, timedelta
 
 
-def max_lots(api: ProjectXAPI, account_id: int, symbol: str, risk_per_trade: float = 0.01) -> float:
-    """
-    Berechnet, wie viele Lots basierend auf risk_per_trade-Prozent der freien Margin
-    für das gegebene Symbol maximal platziert werden können.
-    """
-    # 1) Hole Kontodetails über den Wrapper
+
+def max_lots(api: ProjectXAPI, account_id: int, contract_id: str, risk_per_trade: float = 0.01) -> float:
+    details = api.get_account_details(account_id)
+    # 1) Konto-Details holen
     details = api.get_account_details(account_id)
     if details is None:
         raise RuntimeError("API: Konto-Details nicht abrufbar")
     free_margin = details.get("freeMargin", details.get("balance", 0.0))
 
-    # 2) Hole den aktuellen Preis (Ask oder Bid) über den Wrapper
-    quote = api.get_quote(contract_id=symbol)
+    # 2) Aktuellen Preis per Contract-ID holen
+    quote = api.get_quote(contract_id=contract_id)
     if not quote:
-        raise RuntimeError(f"API: Quote nicht verfügbar für {symbol}")
+        raise RuntimeError(f"API: Quote nicht verfügbar für Contract-ID {contract_id}")
     price = quote.get("ask") or quote.get("bid")
     if price is None:
-        raise RuntimeError(f"API: Ask/Bid nicht verfügbar für {symbol}")
+        raise RuntimeError(f"API: Ask/Bid nicht verfügbar für Contract-ID {contract_id}")
 
-    # 3) Bestimme die Margin-Anforderung für 1 Lot (je nachdem, welche Feldnamen dein Wrapper liefert):
-    #    Wir gehen davon aus, dass unter "contractDetails" ein Feld "initialMargin" oder "marginInitial" steht.
-    contract = api.get_contract_details(symbol)
+    # 3) Contract-Details per Contract-ID abrufen
+    contract = api.get_contract_details(contract_id)
     if not contract:
-        raise RuntimeError(f"API: Contract-Details nicht verfügbar für {symbol}")
-    # Beispiel: falls sich Margin-Bedarf explizit im Dictionary findet:
+        raise RuntimeError(f"API: Contract-Details nicht verfügbar für Contract-ID {contract_id}")
+
     margin_per_lot = contract.get("initialMargin") or contract.get("marginInitial")
     if margin_per_lot is None:
-        # Fallback: falls keine eigene Margin-Angabe vorhanden ist, approximiere über price und contractSize
         contract_size = contract.get("contractSize", 1.0)
         margin_per_lot = price * contract_size
 
-    # 4) Berechne erlaubte Lots anhand des Risikoprozentsatzes
+    # 4) Max. Lots basierend auf Risiko berechnen
     allowed = (free_margin * risk_per_trade) / margin_per_lot
 
-    # 5) Runden auf zwei Dezimalstellen
+    # 5) Ergebnis runden
     return round(allowed, 2)
+
 
 
 
@@ -58,6 +55,8 @@ class TradingStrategy:
         self.symbol = symbol
         self.api = api
         self.account_id = account_id
+        self.data_handler = data_handler
+        self.contract_id_map = {}
 
         self.controller = MultiTimeframeController(
             symbol=symbol,
@@ -70,18 +69,14 @@ class TradingStrategy:
         )
 
 
-    def start(self) -> None:
-        # Erstinitialisierung
-        self.controller.initialize()
-
-        # Abonniere neue Kerzen (Candles) für alle Timeframes über den API-Wrapper
-        for tf in (K, B, E):
-            # Beispiel: data_handler hat jetzt eine Methode `subscribe_candles`
-            self.controller.data.subscribe_candles(
+    def start(self):
+        for tf in [K, B, E]:  # z.B. 900s, 180s, 15s
+            self.data_handler.subscribe_candles(
                 contract_id=self.symbol,
                 timeframe=tf,
-                callback=lambda raw, tf=tf: self._on_candle(tf, raw)
+                callback=lambda c, tf=tf: self.controller.on_new_candle(tf, c)
             )
+
 
 
     def _on_candle(self, timeframe: int, raw_candle) -> None:
