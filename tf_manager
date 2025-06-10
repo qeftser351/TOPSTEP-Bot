@@ -195,10 +195,7 @@ class MultiTimeframeController:
                 self.entry_timestamps[self.open_ticket] = entry_ts
                 self.break_even_applied[self.open_ticket] = False
                 self.risk_mgr.trailing_levels[self.open_ticket] = 0
-                print(f"[INIT] Übernehme Position {pos['positionId']}: Entry-Time={entry_ts}, Price={self.entry_price}, SL={self.initial_stop}")
 
-            print(f"[INIT DEBUG] entry_timestamps nach initialize: {self.entry_timestamps}")
-            print(f"[INIT DEBUG] entry_price={self.entry_price}, initial_stop={self.initial_stop}")
 
         # Initialer Phasenwechsel
         if can_k_to_b(self.phases[K]):
@@ -226,15 +223,6 @@ class MultiTimeframeController:
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(seconds=tf_seconds * limit)
 
-        print("[DEBUG] API-Aufruf:", {
-            "contract_id": symbol,
-            "unit": 1,
-            "unit_number": 15,
-            "limit": limit * (tf_seconds // 15),
-            "start_time": start_time.isoformat() + "Z",
-            "end_time": end_time.isoformat() + "Z"
-        })
-
         raw = self.api.get_candles(
             contract_id=symbol,
             unit=1,              # 1=Sekunden
@@ -245,9 +233,6 @@ class MultiTimeframeController:
             end_time=end_time,
             include_partial_bar=False
         )
-
-        print(f"[DEBUG] Erste Rohdaten: {raw[:5]}")
-        print(f"[DEBUG] Rohkerzen geladen: {len(raw)} für TF={tf_seconds} (Limit={limit})")
 
         # Keys umbenennen für Aggregation
         df = pd.DataFrame(raw)
@@ -263,7 +248,6 @@ class MultiTimeframeController:
         from config.timeframes import aggregate_candles
         agg = aggregate_candles(df.to_dict(orient="records"), tf_seconds)
         
-        print(f"[DEBUG] Aggregierte Kerzen: {len(agg)} für TF={tf_seconds}")
         
         return [Candle(
             timestamp=c["timestamp"],
@@ -285,13 +269,28 @@ class MultiTimeframeController:
 
 
     def on_new_candle(self, tf: int, candle: Candle) -> None:
+        if not hasattr(self, "contract_id_map"):
+            self.contract_id_map = {}
+
+        # Wenn self.symbol contractId ist, nutze get_contract_details_by_id direkt
+        if self.symbol not in self.contract_id_map:
+            # Wenn du nur symbolische Namen hast, löse zuerst auf:
+            # contract = self.api.get_contract_by_name(self.symbol)
+            # self.contract_id_map[self.symbol] = contract["id"]
         
-        contract = self.api.get_contract(self.symbol)
+            # Wenn self.symbol schon contractId ist, speichere es direkt:
+            self.contract_id_map[self.symbol] = self.symbol
+
+        contract_id = self.contract_id_map[self.symbol]
+
+        contract = self.api.get_contract_details_by_id(contract_id)
         stop_level = contract.get("tradeStopsLevel", 0)
-        ttick_size = contract.get("tickSize", self.tick_size)
-        quote      = self.api.get_quote(contract_id=self.symbol)
-        ask = quote["ask"]
-        bid = quote["bid"]
+        tick_size = contract.get("tickSize", self.tick_size)
+
+        quote = self.api.get_quote(contract_id=contract_id)
+        ask = quote.get("ask")
+        bid = quote.get("bid")
+
 
         
         # 1) Sync Entry-Timestamps sofort ganz oben API-RDY
@@ -309,8 +308,6 @@ class MultiTimeframeController:
                     self.side          = 'buy' if p["side"].lower()=="buy" else 'sell'
                     self.break_even_applied[p["positionId"]]   = False
                     self.risk_mgr.trailing_levels[p["positionId"]] = 0
-                    print(f"[SYNC] Übernehme Position {p['positionId']}: Entry-Time={entry_ts}, Price={self.entry_price}, SL={self.initial_stop}")
-        print(f"[DEBUG] on_new_candle: TF={tf} Symbol={self.symbol} TS={candle.timestamp}, id={id(self)}")
         
             # 1. ***NEU: Alle Zeiteinheiten auf neue abgeschlossene Kerzen prüfen und ggf. updaten***
         for tf_upd in (K, B):
@@ -321,8 +318,14 @@ class MultiTimeframeController:
             last_ts = last_hist[-1].timestamp if last_hist else None
             # Hole die neuesten Kerzen (Achtung: immer OHNE laufende Kerze)
             new_hist = self.fetch_history(self.symbol, tf_upd, get_history_limit(tf_upd))[:-1]
-            if new_hist and (not last_ts or new_hist[-1].timestamp > last_ts):
-                # Es gibt ein neues, noch nicht verarbeitetes Candle!
+            ts = new_hist[-1].timestamp
+            if isinstance(ts, int):
+                ts = datetime.fromtimestamp(ts / 1000)  # ms -> s
+
+            if last_ts is not None and isinstance(last_ts, int):
+                last_ts = datetime.fromtimestamp(last_ts / 1000)
+
+            if new_hist and (not last_ts or ts > last_ts):
                 self.history[tf_upd] = new_hist
                 self.machines[tf_upd].context['last_candles'] = new_hist
                 new_phase = self.machines[tf_upd].update(new_hist)
@@ -425,14 +428,12 @@ class MultiTimeframeController:
             current_b_dir = 'buy' if 'BULL' in b_phase.name else 'sell'
             # ZUERST: Richtungsgleichheit B/K prüfen!
             if current_b_dir != current_k_dir:
-                print(f"[INFO] B ({current_b_dir}) passt nicht mehr zu K ({current_k_dir}), wechsle zurück zu K")
                 self.entered_direction = None
                 self._switch_to(K)
                 return
 
             # Dann wie gehabt: Vergleich mit der initialen Richtung aus K
             if current_k_dir != self.entered_direction:
-                print(f"[INFO] K richtung hat sich geändert ({self.entered_direction} → {current_k_dir}), wechsle zurück zu K")
                 self.entered_direction = None
                 self._switch_to(K)
                 return
@@ -452,26 +453,22 @@ class MultiTimeframeController:
             current_k_dir = 'buy' if 'BULL' in k_phase.name else 'sell'
 
             if self._has_active_trade():
-                print(f"[INFO] Aktiver Trade vorhanden – bleibe im E-Timeframe!")
+                pass
                 # KEIN return! Einfach nichts machen, d.h. der Rückwechsel-Block wird übersprungen!
             else:
                 # Rückwechsel zu B oder K prüfen, falls kein Trade offen:
                 if b_phase not in BASE_PHASES:
-                    print(f"[INFO] B ({b_phase.name}) ist KEINE Base-Phase mehr! Wechsel zurück zu B!")
                     self.entered_direction = None
                     self._switch_to(B)
                     self.phases[E] = Phase.NEUTRAL
                     return
 
                 if current_b_dir != current_k_dir:
-                    print(f"[INFO] B ({current_b_dir}) passt nicht mehr zu K ({current_k_dir}), wechsle zurück zu K!")
                     self.entered_direction = None
                     self._switch_to(K)
                     return
 
                 if current_b_dir != self.entered_direction:
-                    print(f"[INFO] B richtung hat sich geändert ({self.entered_direction} → {current_b_dir}), Rückwechsel prüfen…")
-                    print(f"[INFO] B richtung ({current_b_dir}) passt zu K ({current_k_dir}), wechsle zurück zu B")
                     self.entered_direction = None
                     self._switch_to(B)
                     return
@@ -578,10 +575,27 @@ class MultiTimeframeController:
             extreme = 'low' if new_phase == Phase.BASE_SWITCH_BULL else 'high'
             self._record_switch(E, buf, extreme)
             logger.info(f"Confirmation Candle detected: {candle}, close={candle.close}")
-            
-            quote = self.api.get_quote(contract_id=self.symbol)
-            ask = quote["ask"]
-            bid = quote["bid"]
+
+            # Contract-ID aus Cache holen oder laden
+            if not hasattr(self, "contract_id_map"):
+                self.contract_id_map = {}
+
+            if self.symbol not in self.contract_id_map:
+                # Prüfen, ob self.symbol bereits eine Contract-ID ist (beginnt mit "CON.")
+                if self.symbol.startswith("CON."):
+                    self.contract_id_map[self.symbol] = self.symbol
+                else:
+                    contract = self.api.get_contract_by_name(self.symbol)
+                    self.contract_id_map[self.symbol] = contract["id"]
+
+            contract_id = self.contract_id_map[self.symbol]
+
+            # Quote per Contract-ID holen
+            quote = self.api.get_quote(contract_id=contract_id)
+            ask = quote.get("ask")
+            bid = quote.get("bid")
+
+
 
             entry = None
             if self.entered_direction == 'buy' and new_phase == Phase.BASE_SWITCH_BULL:
@@ -666,15 +680,25 @@ class MultiTimeframeController:
         # 9) Guard gegen neue Entries
         pend = self.api.get_open_orders(self.account_id) or []
         pos  = self.api.get_positions(self.account_id) or []
-        if pend or any(p.get("customTag")=="234000" for p in pos):
+        if pend or any(p.get("customTag") == "234000" for p in pos):
             return
-        
-        contract = self.api.get_contract(self.symbol)
+
+        # contract_id laden/cache
+        if not hasattr(self, "contract_id_map"):
+            self.contract_id_map = {}
+        if self.symbol not in self.contract_id_map:
+            contract = self.api.get_contract_by_name(self.symbol)
+            self.contract_id_map[self.symbol] = contract["id"]
+        contract_id = self.contract_id_map[self.symbol]
+
+        contract = self.api.get_contract_details_by_id(contract_id)
         stop_level = contract.get("tradeStopsLevel", 0)
-        tick_size = contract.get("tickSize", self.tick_size)  # falls der Wrapper das so liefert
-        quote      = self.api.get_quote(contract_id=self.symbol)
-        ask = quote["ask"]
-        bid = quote["bid"]
+        tick_size = contract.get("tickSize", self.tick_size)  # fallback
+
+        quote = self.api.get_quote(contract_id=contract_id)
+        ask = quote.get("ask")
+        bid = quote.get("bid")
+
 
         
                 # 11) Entry-Logik (Fallback)
@@ -714,7 +738,8 @@ class MultiTimeframeController:
     def _open_new_trade(self, entry: Dict[str, float]) -> None:
         tick = self.tick_size
         
-        contract = self.api.get_contract_details(self.symbol)
+        contract_id = self.contract_id_map.get(self.symbol)
+        contract = self.api.get_contract_details_by_id(contract_id)
         stop_level = contract.get("tradeStopsLevel", 0)
 
         # Runden auf Tickgröße
@@ -759,13 +784,11 @@ class MultiTimeframeController:
         raw_hist = self.fetch_history(self.symbol, tf, get_history_limit(tf))
         hist = raw_hist[:-1]
         if not hist or len(hist) < 3:
-            print(f"[ERROR] Nicht genügend Candles ({len(hist)}) für TF {tf}, kein Replay/Reset!")
             return
         self.machines[tf].context.clear()
         self.history[tf]=hist
         self.machines[tf].context['last_candles'] = hist
         self.phases[tf] = self.machines[tf].replay_from_scratch(hist)
-        print(f"[DEBUG] FSM Context nach Replay für TF={tf}:", self.machines[tf].context)
         self.active_tf=tf
         if tf == K:
             self._bounce_from_k_if_needed()
@@ -784,7 +807,6 @@ class MultiTimeframeController:
             extreme = 'low' if self.entered_direction == 'buy' else 'high'
             self._record_switch(K, self.history[K], extreme)
             self._switch_to(B)
-            print(f"[INFO] Sofortiger Bounce: K ({k_phase.name}) → zurück nach B!")
 
 
     def _record_switch(self, tf: int, buf: List[Candle], extreme: str) -> None:
@@ -805,6 +827,8 @@ class MultiTimeframeController:
     
     
 
+
+
     def print_summary(self) -> None:
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now}] {self.symbol} summary:")
@@ -814,45 +838,52 @@ class MultiTimeframeController:
             phase = self.phases.get(tf)
             act = '*' if tf == self.active_tf else ''
             line = f"  {lbl}{act}: {phase.name if phase else 'N/A'}"
-            # --- NEU: EMAs berechnen und ausgeben ---
+        
             history = self.history.get(tf)
             if history and len(history) >= 20:
                 close_prices = pd.Series([getattr(c, EMA_SOURCE) for c in history])
                 ema_10 = _ema(close_prices, 10)
                 ema_20 = _ema(close_prices, 20)
                 last_candle = history[-1]
-                # Optional: Zeitstempel der letzten Kerze dazuschreiben
-                line += f" | last_candle: {last_candle.timestamp} | EMA10={ema_10:.5f} EMA20={ema_20:.5f}"
+            
+                ts = last_candle.timestamp
+                if isinstance(ts, (int, float)):
+                    # Timestamp evtl. in Millisekunden, dann in Sekunden konvertieren
+                    if ts > 1e12:
+                        ts = ts / 1000
+                    dt = datetime.utcfromtimestamp(ts)
+                else:
+                    dt = ts  # evtl. schon datetime-Objekt
+            
+                line += f" | last_candle: {dt.strftime('%Y-%m-%d %H:%M:%S')} | EMA10={ema_10:.5f} EMA20={ema_20:.5f}"
             else:
                 line += " | EMA10/20: n/a"
-            
-            
+        
             if phase == Phase.SWITCH_BULL:
                 d = self.switch_data.get(tf, {})
                 line += f" | initLow={d.get('initial_extreme')} prevHigh={d.get('previous_extreme')}"
             if phase == Phase.SWITCH_BEAR:
                 d = self.switch_data.get(tf, {})
                 line += f" | initHigh={d.get('initial_extreme')} prevLow={d.get('previous_extreme')}"
-
-            # --- NUR wenn noch Order/Position da ist: entry/sl/RR anzeigen! ---
+        
+            # Weitere Logik für offene Orders/Positionen (unverändert)
             if tf == E and self.open_ticket is not None:
-                # Prüfen, ob Order oder Position existiert
-                # (Ersetze ggf. magic=234000 durch deine Konstante)
-                has_order = any(o["orderId"]==self.open_ticket for o in self.api.get_open_orders(self.account_id) if o.get("customTag")=="234000")
-                has_pos   = any(p["positionId"]==self.open_ticket for p in self.api.get_positions(self.account_id) if p.get("customTag")=="234000")
+                has_order = any(o["orderId"] == self.open_ticket for o in self.api.get_open_orders(self.account_id) if o.get("customTag") == "234000")
+                has_pos = any(p["positionId"] == self.open_ticket for p in self.api.get_positions(self.account_id) if p.get("customTag") == "234000")
                 if has_order or has_pos:
                     rr = (abs(self.entry_price - self.initial_stop) if self.entry_price and self.initial_stop else None)
                     line += f" | entry={self.entry_price:.5f}, sl={self.initial_stop:.5f}"
                     if rr is not None:
                         line += f", 1RR={rr:.5f}"
                 else:
-                    # Wenn weder Order noch Position existiert: cleanup!
                     self.open_ticket = None
                     self.entry_price = None
                     self.initial_stop = None
                     self.current_sl = None
                     self.side = None
+        
             print(line)
+
             
         # --- Hier der Aufruf fürs CSV-Logging ---
         phase_15m = self.phases.get(K).name if self.phases.get(K) else ""
