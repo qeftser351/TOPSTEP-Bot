@@ -117,10 +117,21 @@ class RiskManager:
         entry_price: float,
         spread: float
     ) -> Optional[float]:
-        quote = self.api.get_quote(contract_id=symbol)
+        # 1. Contract-ID zum Symbol holen
+        contract = self.api.resolve_contract_id_by_symbol(symbol)
+        contract_id = contract["id"]
+
+        # 2. Quote per contract_id holen
+        quote = self.api.get_quote(contract_id)
+
+        # Rest deiner Logik hier ...
+        bid = quote.get("bid")
+        ask = quote.get("ask")
+        if bid is None or ask is None:
+            raise RuntimeError(f"Quote für Contract-ID {contract_id} ungültig")
+    
         go_candle = None
         go_index = -1
-        
 
         # 1) Finde Go-Kerze (Bullish)
         for idx, c in enumerate(candles):
@@ -140,9 +151,8 @@ class RiskManager:
             if not confirmation_seen:
                 if c.close > go_candle.high and c.low > entry_price:
                     confirmation_seen = True
-                # andernfalls, wenn Kerze low <= entry_price wieder berührt, reset
                 elif c.low <= entry_price:
-                    # suche ab nächster Kerze in 'candles' nach neuer Go-Kerze
+                    # Suche ab nächster Kerze in 'candles' nach neuer Go-Kerze
                     for j in range(go_index + 1, len(candles)):
                         c2 = candles[j]
                         if c2.high >= entry_price and c2.close > entry_price:
@@ -155,18 +165,17 @@ class RiskManager:
                         return None
                     continue
 
-            # b) Erst nach Confirmation in der nächsten Kerze BE setzen
-            #    also, sobald confirmation_seen True und wir hier sind:
+            # b) Sobald confirmation_seen True, BE setzen
             candidate_sl = entry_price - spread
 
             # 3) Fallback-Distanz (nur hier!)
-            price_ref = quote["bid"]
-            min_dist = self._get_min_stop_distance(self.symbol, fallback_pips=0.5)
+            price_ref = quote.get("bid")
+            min_dist = self._get_min_stop_distance(symbol, fallback_pips=0.5)
             if candidate_sl >= price_ref - min_dist:
                 candidate_sl = price_ref - min_dist
 
             # 4) Rundung auf gültigen Tick
-            contract  = self.api.get_contract(self.symbol)
+            contract = self.api.get_contract(symbol)
             tick_size = contract.get("tickSize", self.tick_size)
             decimals = int(-math.log10(tick_size))
             candidate_sl = math.floor(candidate_sl / tick_size) * tick_size
@@ -185,7 +194,13 @@ class RiskManager:
         entry_price: float,
         spread: float
     ) -> Optional[float]:
-        quote = self.api.get_quote(contract_id=symbol)
+        # 1. Contract-ID zum Symbol holen
+        contract = self.api.resolve_contract_id_by_symbol(symbol)
+        contract_id = contract["id"]
+
+        # 2. Quote per contract_id holen
+        quote = self.api.get_quote(contract_id)
+
         go_candle = None
         go_index = -1
 
@@ -207,7 +222,6 @@ class RiskManager:
             if not confirmation_seen:
                 if c.close < go_candle.low and c.high < entry_price:
                     confirmation_seen = True
-                # andernfalls, wenn Kerze high >= entry_price wieder berührt, reset
                 elif c.high >= entry_price:
                     # neue Go-Kerze suchen (ab dem nächsten Index)
                     for j in range(go_index+1, len(candles)):
@@ -222,17 +236,17 @@ class RiskManager:
                         return None
                     continue
 
-            # b) Erst nach Confirmation in der nächsten Kerze BE setzen
+            # b) Erst nach Confirmation BE setzen
             candidate_sl = entry_price + spread
 
             # 3) Fallback-Distanz (nur hier!)
-            price_ref = quote["ask"]
-            min_dist  = self._get_min_stop_distance(self.symbol, fallback_pips=0.5)
+            price_ref = quote.get("ask")
+            min_dist  = self._get_min_stop_distance(symbol, fallback_pips=0.5)
             if candidate_sl <= price_ref + min_dist:
                 candidate_sl = price_ref + min_dist
 
             # 4) Rundung auf gültigen Tick
-            contract  = self.api.get_contract(self.symbol)
+            contract  = self.api.get_contract(symbol)
             tick_size = contract.get("tickSize", self.tick_size)
             decimals = int(-math.log10(tick_size))
             candidate_sl = math.floor(candidate_sl / tick_size) * tick_size
@@ -241,6 +255,7 @@ class RiskManager:
             return candidate_sl
 
         return None
+
 
 
 
@@ -274,53 +289,66 @@ class RiskManager:
         ticket: int
     ) -> Optional[float]:
         # 1) Contract-Details holen
-        contract  = self.api.get_contract(self.symbol)
+        contract = self.api.get_contract(symbol)
         tick_size = contract.get("tickSize", self.tick_size)
-        stops     = contract.get("tradeStopsLevel", 0)
+        stops = contract.get("tradeStopsLevel", 0)
         min_dist = (
-            stops * tick_size
-            if stops > 0
-            else self._get_min_stop_distance(self.symbol, 0.5)
+            stops * tick_size if stops > 0 else self._get_min_stop_distance(symbol, 0.5)
         )
+
         # 2) Go-Candle finden (Identisch zur MT5-Logik)
         go_idx = next(
-            (i for i, c in enumerate(candles)
-            if (side == 'buy' and c.high >= entry_price and c.close > entry_price)
-            or (side == 'sell' and c.low <= entry_price and c.close < entry_price)),
-            None
+            (
+                i
+                for i, c in enumerate(candles)
+                if (side == "buy" and c.high >= entry_price and c.close > entry_price)
+                or (side == "sell" and c.low <= entry_price and c.close < entry_price)
+            ),
+            None,
         )
         if go_idx is None:
             return None
         relevant = candles[go_idx:]
+
         # 3) Neues SL berechnen
-        new_sl = (
-            self.calculate_breakeven_price_buy(relevant, entry_price, spread)
-            if side == 'buy'
-            else self.calculate_breakeven_price_sell(relevant, entry_price, spread)
-        )
+        if side == "buy":
+            new_sl = self.calculate_breakeven_price_buy(symbol, relevant, entry_price, spread)
+        else:
+            new_sl = self.calculate_breakeven_price_sell(symbol, relevant, entry_price, spread)
+
         if new_sl is None or new_sl == current_sl:
             return None
-        # 4) Preisreferenz aus Quote holen
-        quote = self.api.get_quote(contract_id=symbol)
-        price_ref = quote["bid"] if side=='buy' else quote["ask"]
+
+        # Contract-ID holen
+        contract = self.api.resolve_contract_id_by_symbol(symbol)
+        contract_id = contract["id"]
+
+        # Quote per Contract-ID abrufen
+        quote = self.api.get_quote(contract_id)
+        price_ref = quote.get("bid") if side == "buy" else quote.get("ask")
+
         # 5) Clamp ↔ min_dist prüfen
         if abs(new_sl - price_ref) < min_dist:
-            new_sl = price_ref - min_dist if side=='buy' else price_ref + min_dist
+            new_sl = price_ref - min_dist if side == "buy" else price_ref + min_dist
+
         # 6) Auf Tick-Größe runden
         decimals = int(-math.log10(tick_size))
-        if side == 'buy':
+        if side == "buy":
             new_sl = math.ceil(new_sl / tick_size) * tick_size
         else:
             new_sl = math.floor(new_sl / tick_size) * tick_size
         new_sl = round(new_sl, decimals)
+
         # 7) Tatsächlich SL ändern über API
         try:
             self.api.update_position_stop(position_id=ticket, stop_loss=new_sl)
         except Exception as e:
             print(f"[ERROR] Break-Even fehlgeschlagen: {e}")
             return None
+
         self.trailing_levels[ticket] = 0  # optional: Reset trailing-level nach BE
         return new_sl
+
 
 
 
@@ -336,14 +364,10 @@ class RiskManager:
         current_sl: float,
         ticket: int
     ) -> Optional[float]:
-        """
-        Berechnet und setzt einen neuen Trailing-Stop über die ProjectXAPI.
-        Rückgabe: das neue SL-Level oder None, falls kein Update erfolgt.
-        """
         import math
 
         # 1) Contract-Details holen (für tickSize und tradeStopsLevel)
-        contract  = self.api.get_contract(symbol)
+        contract = self.api.get_contract(symbol)
         tick_size = contract.get("tickSize", self.tick_size)
         stops_level = contract.get("tradeStopsLevel", 0)
 
@@ -358,8 +382,7 @@ class RiskManager:
         rr = abs(entry_price - initial_stop)
         last_level = self.trailing_levels.get(ticket, 0)
 
-        # Ermitteln, wie viele RR es sind
-        if side == 'buy':
+        if side == "buy":
             max_high = max((c.high for c in candles), default=entry_price)
             level = int((max_high - entry_price) / rr) if rr > 0 else 0
             if level >= 3 and level > last_level:
@@ -374,27 +397,27 @@ class RiskManager:
             else:
                 return None
 
-        # 4) Quote holen, um kandidat vs. Markt zu prüfen
-        quote = self.api.get_quote(contract_id=symbol)
-        price_ref = quote["bid"] if side == 'buy' else quote["ask"]
+        # 4) Contract-ID aus Symbol ermitteln
+        contract = self.api.resolve_contract_id_by_symbol(symbol)
+        contract_id = contract["id"]
+
+        # Quote per Contract-ID abrufen
+        quote = self.api.get_quote(contract_id)
+        price_ref = quote.get("bid") if side == "buy" else quote.get("ask")
 
         # Clamp: Nie näher als min_dist zum aktuellen Preis
-        if side == 'buy':
-            # Trailing-Stop darf maximal bei price_ref - min_dist liegen
+        if side == "buy":
             candidate = min(candidate, price_ref - min_dist)
         else:
             candidate = max(candidate, price_ref + min_dist)
 
         # Falls nach Clamp noch zu nah am Markt, hart auf price_ref ± min_dist setzen
         if abs(candidate - price_ref) < min_dist:
-            if side == 'buy':
-                candidate = price_ref - min_dist
-            else:
-                candidate = price_ref + min_dist
+            candidate = price_ref - min_dist if side == "buy" else price_ref + min_dist
 
         # 5) Rundung auf gültige Tick-Größe
         decimals = int(-math.log10(tick_size))
-        if side == 'buy':
+        if side == "buy":
             candidate = math.ceil(candidate / tick_size) * tick_size
         else:
             candidate = math.floor(candidate / tick_size) * tick_size
@@ -402,10 +425,7 @@ class RiskManager:
 
         # 6) Prüfen, ob Position noch existiert
         positions = self.api.get_positions(self.account_id)
-        for p in positions:
-            if p.get("positionId") == ticket:
-                break
-        else:
+        if not any(p.get("positionId") == ticket for p in positions):
             # Position nicht mehr offen
             return None
 
@@ -419,6 +439,7 @@ class RiskManager:
         # 8) Erfolgreiches Update → trailing_level aktualisieren
         self.trailing_levels[ticket] = level
         return candidate
+
 
 
 
