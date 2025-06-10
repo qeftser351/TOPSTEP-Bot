@@ -16,6 +16,7 @@ from requests.exceptions import HTTPError
 
 
 
+
 class DataHandler:
     # Mapping von MT5-Konstanten auf interne Labels (nur als Referenz, wird hier nicht verwendet)
     TIMEFRAME_MAP: Dict[int, str] = {
@@ -36,6 +37,7 @@ class DataHandler:
         self.last_history_ts: Dict[str, Dict[int, Optional[datetime]]] = {}
         self.contract_details_cache: Dict[str, dict] = {}
         self.contract_name_cache: Dict[str, str] = {}
+        self.ws_client = None
 
 
     def fetch_history(self, contract_id: str, timeframe: int, limit: int) -> List[Candle]:
