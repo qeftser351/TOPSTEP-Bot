@@ -1,58 +1,68 @@
 import time
-from datetime import datetime
-import math
+from datetime import datetime, timedelta
 from typing import Dict, List, Callable, Optional
 from types import SimpleNamespace
-from core.types import Candle
-from config.timeframes import get_history_limit, aggregate_candles, TIMEFRAMES
-get_history_limit = lambda tf: int(300 * (tf / 15))
-from core.phase_manager import PhaseStateMachine
-import pytz
-from projectx_api import ProjectXAPI
-from datetime import datetime, timedelta
-import pandas as pd
-from config.timeframes import aggregate_candles
-from requests.exceptions import HTTPError
+from typing import Any
 
+import pytz
+import pandas as pd
+from dateutil import parser
+
+from core.candles import Candle
+from config.timeframes import get_history_limit, TIMEFRAMES
+from projectx_api import ProjectXAPI
+from ws_client_signalr import MarketWSClient
+from typing import Dict, List, Optional, Callable, Tuple
+from config.timeframes import aggregate_candles
+from candle_aggregator import CandleAggregator
+from core.candles import Candle
+from dateutil import parser
+from datetime import datetime
 
 
 
 class DataHandler:
-    # Mapping von MT5-Konstanten auf interne Labels (nur als Referenz, wird hier nicht verwendet)
-    TIMEFRAME_MAP: Dict[int, str] = {
-        # mt5.TIMEFRAME_M1:  '1m',
-        # mt5.TIMEFRAME_M15: '15m',
-        # mt5.TIMEFRAME_H1:  '1h',
-    }
-
-    def __init__(self, api: ProjectXAPI, account_id: int):
+    def __init__(self, api: ProjectXAPI, account_id: int, contract_id_to_name: Dict[str, str]):
         self.api = api
         self.account_id = account_id
+        self.strategy = None
+
+        # Key: contract_id → timeframe (sec) → list of Candle
         self.histories: Dict[str, Dict[int, List[Candle]]] = {}
-        self.subscribers: Dict[str, Dict[int, List[Callable]]] = {}
-        self.phase_machine = PhaseStateMachine()
-        self._running = False
-        self.open_ticket: Optional[int] = None
-        self._pending_to_position: Dict[str, Dict[int, int]] = {}
+
+        # Key: (contract_id, timeframe) → list of callbacks
+        self.subscribers: Dict[Tuple[str, int], List[Callable[[dict], None]]] = {}
+
+        # Letzter Timestamp für History-Sync
         self.last_history_ts: Dict[str, Dict[int, Optional[datetime]]] = {}
+
+        # Contract-Caches
         self.contract_details_cache: Dict[str, dict] = {}
         self.contract_name_cache: Dict[str, str] = {}
-        self.ws_client = None
+
+        # WebSocket-Client (Market)
+        self.ws_client: Optional[MarketWSClient] = None
+        
+        self.strategies: Dict[str, Any] = {}
+        
+        self.last_candle_ts: Dict[str, Dict[int, datetime]] = {}
+        
+        self.contract_id_to_name = contract_id_to_name
+        
+
+        
+
+
 
 
     def fetch_history(self, contract_id: str, timeframe: int, limit: int) -> List[Candle]:
-        """
-        Holt historische Kerzen im kleinsten TF (15s) und aggregiert auf den gewünschten timeframe (in Sekunden).
-        """
-        # 1) Zeitfenster berechnen
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(seconds=timeframe * limit)
 
-        # 2) Rohdaten vom Server (15s-Bars) holen
         raw = self.api.get_candles(
             contract_id=contract_id,
-            unit=1,                 # 1 = Sekunden
-            unit_number=15,         # 15s-Bars
+            unit=1,               # Sekunden
+            unit_number=15,       # 15s-Bars
             limit=limit * (timeframe // 15),
             live=False,
             start_time=start_time,
@@ -60,42 +70,176 @@ class DataHandler:
             include_partial_bar=False
         )
 
-        # 3) Spalten umbenennen für Aggregation
+        if not raw:
+            print(f"[ERROR] Keine historischen Kerzen empfangen für {contract_id}")
+            return []
+
+
         df = pd.DataFrame(raw)
         df.rename(columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume"
+            "t": "timestamp", "o": "open", "h": "high", "l": "low",
+            "c": "close", "v": "volume"
         }, inplace=True)
 
-        # 4) Auf Ziel-Timeframe aggregieren
-        agg = aggregate_candles(df.to_dict(orient="records"), timeframe)
+        df["timestamp"] = df["timestamp"].apply(lambda ts: (
+            datetime.utcfromtimestamp(ts / 1000) if isinstance(ts, (int, float))
+            else parser.isoparse(ts).replace(tzinfo=None)
+        ))
 
-        # 5) In dein Candle-Objekt konvertieren
-        candles: List[Candle] = []
-        for bar in agg:
-            ts_ms = bar["timestamp"]
-            ts = datetime.utcfromtimestamp(ts_ms / 1000)
-            candles.append(Candle(
-                timestamp=ts,
-                open=bar["open"],
-                high=bar["high"],
-                low=bar["low"],
-                close=bar["close"],
-                volume=bar["volume"]
-            ))
+        # 🔁 Aggregation über zentrale Funktion
+        candles_raw = df.to_dict(orient="records")
+        aggregated = aggregate_candles(candles_raw, timeframe)
 
-        # 6) Optional: Cache + Rückgabe
+        candles = [Candle.from_dict(c) for c in aggregated]
+
         self.histories.setdefault(contract_id, {})[timeframe] = candles.copy()
         self.last_history_ts.setdefault(contract_id, {})[timeframe] = candles[-1].timestamp if candles else None
-
         return candles
 
-    def append_and_get(self, symbol: str, timeframe: int, candle: Candle) -> List[Candle]:
-        # Timestamp in UTC-naiv umwandeln, falls nötig:
+
+    
+    def _handle_candle(self, contract_id: str, timeframe: int, candle: Candle):
+        print(f"[DEBUG] dispatch {contract_id} {timeframe}s → {candle.timestamp}")
+        key = (contract_id, timeframe)
+        subs = self.subscribers.get(key, [])
+        print(f"[DEBUG] dispatch {contract_id} {timeframe}s → {candle.timestamp} to {len(subs)} subscribers")
+        for cb in subs:
+            cb(candle.to_dict())
+
+            
+    
+    def start_ws(self, token: str, contract_ids: List[str]):
+        from ws_client_signalr import MarketWSClient
+
+        # Aggregator für 15s-Candles
+        self.quote_aggregator = CandleAggregator(
+            interval_seconds=15,
+            on_new_candle=self._on_15s_candle  # wird direkt vom Aggregator aufgerufen
+        )
+
+        # ✅ Registrierung in zentraler Dispatch-Logik für 15s
+        for contract_id in contract_ids:
+            def handler(contract_id_inner, candle, tf=15, cid=contract_id):  # tf/cid defaulted to avoid late-binding issues
+                self._on_15s_candle(cid, tf, candle)
+            self.subscribe(contract_id, 15, handler)
+
+            
+        print(f"[INIT] contract_name_cache = {self.contract_name_cache}")
+
+        # WebSocket-Client initialisieren
+        self.ws_client = MarketWSClient(
+            token=token,
+            initial_symbols=contract_ids,
+            quote_handler=self._handle_quote,
+            candle_handler=None,  # CandleSeries wird ignoriert
+            contract_id_to_name=self.contract_name_cache
+        )
+
+        # WebSocket mit API verbinden
+        self.api.attach_ws_client(self.ws_client)
+
+        # Verbindung starten
+        self.ws_client.connect(contract_ids)
+
+        
+    def _handle_quote(self, contract_id: str, ts, bid: float, ask: float):
+        original_ts = ts  # Für Debug-Zwecke
+
+        # 🔒 Timestamp-Konvertierung
+        if isinstance(ts, str):
+            try:
+                ts = parser.isoparse(ts).replace(tzinfo=None)
+            except Exception as e:
+                print(f"[ERROR] Timestamp-Parse-Fehler (str): {original_ts} → {e}")
+                return
+        elif isinstance(ts, (int, float)):
+            try:
+                # Nur gültige Unix-Zeiten zulassen
+                if ts < 0 or ts > 1e12:  # unrealistisch → vermutlich falsch
+                    print(f"[ERROR] Ungültiger Unix-Timestamp: {ts}")
+                    return
+                ts = datetime.utcfromtimestamp(ts)
+            except Exception as e:
+                print(f"[ERROR] Timestamp-Fehler (float/int): {original_ts} → {e}")
+                return
+        elif not isinstance(ts, datetime):
+            print(f"[ERROR] Ungültiger Timestamp-Typ: {original_ts} ({type(original_ts)})")
+            return
+
+        if hasattr(self, "quote_aggregator"):
+            try:
+                self.quote_aggregator.update(contract_id, bid, ask, ts)
+            except Exception as e:
+                print(f"[ERROR] Aggregator-Update-Fehler: contract_id={contract_id}, ts={ts}, bid={bid}, ask={ask} → {e}")
+
+
+
+
+            
+            
+    def _on_15s_candle(self, contract_id: str, timeframe: int, candle: Candle):
+        print(f"[15s-Candle] {contract_id} @ {candle.timestamp} | O={candle.open} H={candle.high} L={candle.low} C={candle.close}")
+
+        # 1. 15s speichern
+        self.append_and_get(contract_id, 15, candle)
+        self._handle_candle(contract_id, 15, candle)
+        
+        print(f"[DEBUG] {tf}s COUNT: {len(self.histories[contract_id][tf])}")
+
+        # 2. an Strategy-Controller weiterreichen
+        if self.strategies.get(contract_id):
+            self.strategies[contract_id].on_new_candle(contract_id, 15, candle)
+
+        # 3. lokale Aggregation: 15s → 3m → 15m
+        candles_15s = self.histories.get(contract_id, {}).get(15, [])
+        if not candles_15s:
+            print(f"[DEBUG] {contract_id}: Keine 15s-Candles vorhanden.")
+            return
+
+        print(f"[DEBUG] {contract_id} hat {len(candles_15s)} × 15s-Candles")
+        print(f"[DEBUG] 15s Time-Range: {candles_15s[0].timestamp} → {candles_15s[-1].timestamp}")
+
+        for tf in [180, 900]:  # 3m, 15m
+            candles_dicts = [c.to_dict() for c in candles_15s]
+            aggregated = aggregate_candles(candles_dicts, tf)
+
+            if not aggregated:
+                print(f"[DEBUG] ❌ Keine {tf}s-Candles aggregiert für {contract_id}")
+                continue
+
+            last_candle_data = aggregated[-1]
+            last_candle = Candle(**last_candle_data)
+            last_ts = self.last_candle_ts.get(contract_id, {}).get(tf)
+            if last_ts and last_candle.timestamp <= last_ts:
+                print(f"[SKIP] {tf}s Candle bereits verarbeitet: {last_candle.timestamp}")
+                continue
+
+            print(f"[DEBUG] ✅ Aggregierte {tf}s-Candle für {contract_id}: {last_candle.timestamp}")
+
+            # ✅ Safe einspeisen und verarbeiten
+            self.append_and_get(contract_id, tf, last_candle)
+            self._handle_candle(contract_id, tf, last_candle)
+
+            self.last_candle_ts.setdefault(contract_id, {})[tf] = last_candle.timestamp
+
+            if self.strategies.get(contract_id):
+                self.strategies[contract_id].on_new_candle(contract_id, tf, last_candle)
+
+
+
+
+
+    
+    def subscribe_candles(self, contract_id: str, timeframe: int, callback: Callable):
+        key = (contract_id, timeframe)
+        if key not in self.subscribers:
+            self.subscribers[key] = []
+        self.subscribers[key].append(callback)
+
+
+
+    def append_and_get(self, contract_id: str, timeframe: int, candle: Candle) -> List[Candle]:
+        # 1. Timestamp in UTC-naiv umwandeln (falls nötig)
         if candle.timestamp.tzinfo is not None:
             candle_ts = candle.timestamp.astimezone(pytz.UTC).replace(tzinfo=None)
             candle = Candle(
@@ -104,43 +248,55 @@ class DataHandler:
                 high=candle.high,
                 low=candle.low,
                 close=candle.close,
-                volume=candle.volume
+                volume=candle.volume,
+                open_bid=candle.open_bid,
+                high_bid=candle.high_bid,
+                low_bid=candle.low_bid,
+                close_bid=candle.close_bid,
+                open_ask=candle.open_ask,
+                high_ask=candle.high_ask,
+                low_ask=candle.low_ask,
+                close_ask=candle.close_ask
             )
 
-        if timeframe not in self.histories.get(symbol, {}):
+        # 2. Initialisierung von Strukturen
+        self.histories.setdefault(contract_id, {})
+        self.last_history_ts.setdefault(contract_id, {})
+        self.last_candle_ts.setdefault(contract_id, {})
+
+        if timeframe not in self.histories[contract_id]:
             limit = get_history_limit(timeframe)
-            self.fetch_history(symbol, timeframe, limit)
+            self.fetch_history(contract_id, timeframe, limit)
 
-        buf = self.histories[symbol][timeframe]
-        last_hist_ts = self.last_history_ts.get(symbol, {}).get(timeframe)
+        buf = self.histories[contract_id][timeframe]
 
-        if last_hist_ts and candle.timestamp == last_hist_ts:
-            # Bereits vorhanden, nichts ändern
-            self.last_history_ts[symbol][timeframe] = None
+        # 3. Guard: Verhindere Duplikate
+        last_known_ts = self.last_candle_ts[contract_id].get(timeframe)
+        if last_known_ts and candle.timestamp <= last_known_ts:
+            print(f"[GUARD] ⏭️ Duplicate candle: {contract_id} {timeframe}s @ {candle.timestamp}")
             return buf
 
+        # 4. Einfügen
         buf.append(candle)
-        self.last_history_ts[symbol][timeframe] = candle.timestamp
+        self.last_history_ts[contract_id][timeframe] = candle.timestamp
+        self.last_candle_ts[contract_id][timeframe] = candle.timestamp
+
+        # 5. Buffer begrenzen
+        max_len = {
+            15: 120,     # 15s → 30 Minuten
+            180: 80,     # 3m → >4h
+            900: 40,     # 15m → >10h
+        }.get(timeframe, 100)
+
+        if len(buf) > max_len:
+            buf.pop(0)
+
         return buf
 
-    def subscribe(self, symbol: str, timeframe: int, callback: Callable):
-        # Nur unsere Sekunden-basierten Timeframes (K=900, B=180, E=15) zulassen
-        if timeframe not in TIMEFRAMES:
-            raise RuntimeError(f"Unsupported timeframe: {timeframe}")
 
-        subs = self.subscribers.setdefault(symbol, {})
-        if timeframe not in subs:
-            # Historie laden und FSM initialisieren
-            history = self.fetch_history(symbol, timeframe, get_history_limit(timeframe))
-            self.phase_machine.replay_from_scratch(history)
-            subs[timeframe] = []
-
-        if callback not in subs[timeframe]:
-            subs[timeframe].append(callback)
 
 
     def get_symbol_info(self, contract_id: str) -> SimpleNamespace:
-        # Cache Contract-Details
         if contract_id not in self.contract_details_cache:
             contract = self.api.get_contract_details_by_id(contract_id)
             if not contract or "name" not in contract:
@@ -150,14 +306,16 @@ class DataHandler:
         else:
             contract = self.contract_details_cache[contract_id]
 
-        symbol_name = contract.get("name")
-        quote = self.api.get_quote(symbol_name)  # symbolischer Name als Parameter
-        if not quote:
-            raise RuntimeError(f"API: Quote nicht verfügbar für Symbol {symbol_name}")
+        # → Live-Quote aus Websocket-Client holen, wenn vorhanden
+        bid, ask = None, None
+        if hasattr(self.api, "ws_client") and self.api.ws_client:
+            quote = self.api.ws_client.latest_quotes.get(contract_id, {})
+            bid = quote.get("bid")
+            ask = quote.get("ask")
 
         return SimpleNamespace(
-            bid=quote.get("bid"),
-            ask=quote.get("ask"),
+            bid=bid,
+            ask=ask,
             stop_level=contract.get("tradeStopsLevel", 0),
             tick_size=contract.get("tickSize", 0.0)
         )
@@ -166,78 +324,27 @@ class DataHandler:
 
 
 
+
+
         
-    def subscribe_candles(self, contract_id: str, timeframe: int, callback: Callable):
-        self.subscribe(symbol=contract_id, timeframe=timeframe, callback=callback)
+    def subscribe(self, contract_id: str, timeframe: int, callback: Callable[[dict], None]):
+        key = (contract_id, timeframe)
+        if key not in self.subscribers:
+            self.subscribers[key] = []
+        if callback not in self.subscribers[key]:
+            self.subscribers[key].append(callback)
+        print(f"[DataHandler] Subscription registered: {contract_id} @ {timeframe}s")
+                            
+        
+    def stop(self):
+        if self.ws_client:
+            self.ws_client.stop()
+        # Falls du weitere Timer oder Threads im DataHandler hast, hier sauber stoppen.
+        
+    async def user_event(self, event_type, data):
+        print(f"[DataHandler] User Event {event_type}: {data}")
+        # hier kann man weitere Logik ergänzen
 
-
-    def run(self):
-        self._running = True
-        last_processed_second = -1  # verhindert Mehrfachverarbeitung
-
-        while self._running:
-            now = datetime.utcnow()
-
-            # Taktprüfung: exakt bei :00/:15/:30/:45 (±300ms Toleranz)
-            if now.second % 15 != 0 or now.microsecond > 300_000:
-                time.sleep(0.1)
-                continue
-
-            # sicherstellen, dass derselbe Zeitpunkt nicht doppelt verarbeitet wird
-            if now.second == last_processed_second:
-                time.sleep(0.1)
-                continue
-
-            last_processed_second = now.second
-
-            for symbol, tfs in list(self.subscribers.items()):
-                try:
-                    latest_raw = self.api.get_latest_candle(
-                        contract_id=symbol,
-                        unit=1,
-                        unit_number=15
-                    )
-                except HTTPError as e:
-                    print(f"[LIVE DEBUG] HTTPError bei {symbol}: {e.response.status_code} – {e.response.text}")
-                    continue
-
-                if not latest_raw:
-                    print(f"[LIVE DEBUG] Keine Daten empfangen für {symbol}")
-                    continue
-
-                for tf, callbacks in tfs.items():
-                    aggregated = aggregate_candles([latest_raw], tf)
-                    if not aggregated:
-                        continue
-
-                    item = aggregated[0]
-                    ts = datetime.utcfromtimestamp(item["timestamp"] / 1000)
-                    prev_ts = self.last_history_ts.setdefault(symbol, {}).get(tf)
-                    print(f"[DEBUG] Vergleiche Timestamps für {symbol}/{tf}: ts={ts}, prev_ts={prev_ts}")
-                    if prev_ts is not None and ts <= prev_ts:
-                        continue  # keine neue Kerze
-
-                    print(f"[LIVE DEBUG] Neue Kerze für {symbol}/{tf} @ {ts}")
-                    self.last_history_ts[symbol][tf] = ts
-
-                    candle = Candle(
-                        timestamp=ts,
-                        open=item["open"],
-                        high=item["high"],
-                        low=item["low"],
-                        close=item["close"],
-                        volume=item["volume"]
-                    )
-
-                    limit = get_history_limit(tf)
-                    self.histories.setdefault(symbol, {}).setdefault(tf, []).append(candle)
-                    self.histories[symbol][tf] = self.histories[symbol][tf][-limit:]
-
-                    _ = self.phase_machine.update(self.histories[symbol][tf])
-                    for cb in callbacks:
-                        cb(candle)
-
-            time.sleep(0.1)  # kurze Pause, um CPU zu schonen
 
 
 
