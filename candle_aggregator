@@ -4,6 +4,7 @@ from typing import Callable, Dict, List, Tuple
 from core.candles import Candle
 from datetime import datetime
 from typing import Optional
+import numpy as np
 
 
 class CandleAggregator:
@@ -16,8 +17,13 @@ class CandleAggregator:
     def update(self, symbol: str, bid: float, ask: float, timestamp: Optional[datetime] = None):
         if timestamp is None:
             timestamp = datetime.utcnow()
-
-        if not isinstance(timestamp, datetime):
+        elif isinstance(timestamp, (int, float, np.integer)):
+            try:
+                timestamp = datetime.utcfromtimestamp(int(timestamp))
+            except Exception as e:
+                print(f"[ERROR] Timestamp-Konvertierung fehlgeschlagen: {timestamp} ({type(timestamp)}) → {e}")
+                return
+        elif not isinstance(timestamp, datetime):
             print(f"[ERROR] Ungültiger Timestamp: {timestamp} ({type(timestamp)})")
             return
 
