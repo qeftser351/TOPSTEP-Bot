@@ -1,0 +1,79 @@
+from datetime import datetime
+from collections import defaultdict
+from typing import Callable, Dict, List, Tuple
+from core.candles import Candle
+from datetime import datetime
+from typing import Optional
+
+
+class CandleAggregator:
+    def __init__(self, interval_seconds: int, on_new_candle: Callable[[str, Candle], None]):
+        self.interval = interval_seconds
+        self.on_new_candle = on_new_candle
+        self.buffers: Dict[str, List[Tuple[int, float, float]]] = defaultdict(list)
+        self.last_candle_ts: Dict[str, int] = {}
+
+    def update(self, symbol: str, bid: float, ask: float, timestamp: Optional[datetime] = None):
+        if timestamp is None:
+            timestamp = datetime.utcnow()
+
+        if not isinstance(timestamp, datetime):
+            print(f"[ERROR] Ungültiger Timestamp: {timestamp} ({type(timestamp)})")
+            return
+
+        ts = int(timestamp.timestamp())
+        aligned_ts = ts - (ts % self.interval)
+
+        self.buffers[symbol].append((aligned_ts, bid, ask))
+
+        entries = [(b, a) for t, b, a in self.buffers[symbol] if t == aligned_ts]
+        if len(entries) < 3:
+            return
+
+        if self.last_candle_ts.get(symbol) == aligned_ts:
+            return
+
+        self.last_candle_ts[symbol] = aligned_ts
+
+        bids = [b for b, _ in entries]
+        asks = [a for _, a in entries]
+        prices = [(b + a) / 2 for b, a in entries]
+
+        candle = Candle(
+            timestamp=datetime.utcfromtimestamp(aligned_ts),
+            open=prices[0],
+            high=max(prices),
+            low=min(prices),
+            close=prices[-1],
+            volume=len(entries),
+            open_bid=bids[0],
+            high_bid=max(bids),
+            low_bid=min(bids),
+            close_bid=bids[-1],
+            open_ask=asks[0],
+            high_ask=max(asks),
+            low_ask=min(asks),
+            close_ask=asks[-1],
+        )
+
+        # 🧹 Buffer cleanup
+        self.buffers[symbol] = [(t, b, a) for t, b, a in self.buffers[symbol] if t > aligned_ts]
+
+        print(f"[CANDLE_AGG] Neue {self.interval}s-Candle für {symbol} @ {candle.timestamp}: "
+            f"O={candle.open} H={candle.high} L={candle.low} C={candle.close}")
+
+        self.on_new_candle(symbol, self.interval, candle)
+
+        # 🔁 Nach on_new_candle(): höhere TFs aggregieren
+        if hasattr(self.on_new_candle, "__self__"):
+            owner = self.on_new_candle.__self__
+            if hasattr(owner, "try_aggregate_higher_timeframes"):
+                owner.try_aggregate_higher_timeframes(symbol, candle.timestamp)
+                print(f"[DEBUG] Aggregierte 3m: {len(owner.data.histories.get(symbol, {}).get(180, []))}")
+                print(f"[DEBUG] Aggregierte 15m: {len(owner.data.histories.get(symbol, {}).get(900, []))}")
+
+        return candle
+
+
+
+
