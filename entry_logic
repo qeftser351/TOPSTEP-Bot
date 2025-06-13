@@ -2,7 +2,7 @@
 from typing import List, Optional, Dict
 
 # Kerzen und Phasen kommen aus core.types, nicht config.phase
-from core.types      import Candle, Phase
+from core.candles      import Candle, Phase
 from core.phase_manager import PhaseStateMachine
 from config.phase   import is_confirmation_bullish, is_confirmation_bearish
 from config.phase import EMA_FAST_PERIOD, EMA_SLOW_PERIOD, EMA_SOURCE, _ema
@@ -56,7 +56,7 @@ class ConfigEntryLogic:
 
         # === STOP-LOSS 2×Spread zum weitesten EMA ===
         # 1) DataFrame bauen, EMAs berechnen
-        df       = pd.DataFrame([c._asdict() for c in candles])
+        df       = pd.DataFrame([vars(c) for c in candles])
         ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
         ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
 
@@ -105,7 +105,7 @@ class ConfigEntryLogic:
             entry_price = desired_entry
 
         # === STOP-LOSS 2×Spread zum weitesten EMA ===
-        df       = pd.DataFrame([c._asdict() for c in candles])
+        df       = pd.DataFrame([vars(c) for c in candles])
         ema_fast = _ema(df['close'], EMA_FAST_PERIOD)
         ema_slow = _ema(df['close'], EMA_SLOW_PERIOD)
 
