@@ -1,11 +1,11 @@
 import asyncio
 import json
-import threading
 import websockets
 import time
 import threading
 import pandas as pd
 from datetime import datetime
+import numpy as np
 
 
 class BaseProjectXWebSocketClient:
@@ -139,7 +139,7 @@ class MarketWebSocketClient(BaseProjectXWebSocketClient):
     def __init__(self, token, symbol_ids, on_quote):
         # Token als Query-Parameter, Sub-Protocol "json"
         url = f"wss://rtc.topstepx.com/hubs/market?access_token={token}"
-        super().__init__(url, token)
+        super().__init__(url, token, self.handle_message)
         self.symbol_ids = symbol_ids
         self.on_quote = on_quote
         
@@ -161,6 +161,36 @@ class MarketWebSocketClient(BaseProjectXWebSocketClient):
                     print(f"[WS ERROR] Send failed: {e} → {payload}", flush=True)
             else:
                 print("[WS] WARN: ws ist None oder geschlossen – sende nicht", flush=True)
+                
+    async def handle_message(self, message):
+        if message.get("target") != "GatewayQuote":
+            return
+        args = message.get("arguments", [])
+        if len(args) != 2:
+            return
+
+        contract_id, data = args
+
+        # ⛑️ Robust: Timestamp explizit casten → datetime
+        raw_ts = data["timestamp"]
+        if isinstance(raw_ts, (int, float, np.integer)):
+            ts = pd.to_datetime(int(raw_ts), unit='ms', utc=True)
+        elif isinstance(raw_ts, str):
+            ts = pd.to_datetime(raw_ts, utc=True)
+        else:
+            raise TypeError(f"[handle_message] Unsupported timestamp type: {type(raw_ts)} → {raw_ts}")
+
+        bid = data.get("bestBid")
+        ask = data.get("bestAsk")
+
+        # 🧪 Debug-Log
+        print(f"[handle_message] contract_id={contract_id}, ts_raw={raw_ts} ({type(raw_ts)}), "
+              f"ts_parsed={ts} ({type(ts)}), bid={bid}, ask={ask}")
+
+        self.on_quote(contract_id, ts, bid, ask)
+
+
+
 
 
 
