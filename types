@@ -1,22 +1,124 @@
 from enum import Enum
 from typing import NamedTuple, Callable, List, Any, Dict
 from datetime import datetime
+from datetime import timezone
+from dateutil import parser
+import pandas as pd
 
 # --------------------------------------------
 # Candle‑Definition (API-Ready)
 # --------------------------------------------
-class Candle(NamedTuple):
-    timestamp: datetime  # UTC datetime, muss beim Einlesen aus API ms→datetime konvertiert werden
-    open: float
-    high: float
-    low: float
-    close: float
-    volume: float
+class Candle:
+    def __init__(
+        self,
+        timestamp,
+        open,
+        high,
+        low,
+        close,
+        volume,
+        open_bid=None, high_bid=None, low_bid=None, close_bid=None,
+        open_ask=None, high_ask=None, low_ask=None, close_ask=None
+    ):
+        self.timestamp = timestamp
+        self.open = open
+        self.high = high
+        self.low = low
+        self.close = close
+        self.volume = volume
+
+        self.open_bid = open_bid
+        self.high_bid = high_bid
+        self.low_bid = low_bid
+        self.close_bid = close_bid
+
+        self.open_ask = open_ask
+        self.high_ask = high_ask
+        self.low_ask = low_ask
+        self.close_ask = close_ask
+
+    def __repr__(self):
+        return (
+            f"Candle(ts={self.timestamp}, O={self.open}, H={self.high}, L={self.low}, C={self.close}, V={self.volume}, "
+            f"OB={self.open_bid}, HB={self.high_bid}, LB={self.low_bid}, CB={self.close_bid}, "
+            f"OA={self.open_ask}, HA={self.high_ask}, LA={self.low_ask}, CA={self.close_ask})"
+        )
+
+    def to_dict(self):
+        ts = self.timestamp
+        if ts.tzinfo is None:
+            ts = ts.replace(tzinfo=timezone.utc)  # nur setzen, wenn nicht vorhanden
+
+        d = {
+            "t": int(ts.timestamp() * 1000),
+            "o": self.open,
+            "h": self.high,
+            "l": self.low,
+            "c": self.close,
+            "v": self.volume,
+        }
+
+        # Optional-Felder nur aufnehmen, wenn vorhanden
+        for field in [
+            "open_bid", "high_bid", "low_bid", "close_bid",
+            "open_ask", "high_ask", "low_ask", "close_ask"
+        ]:
+            val = getattr(self, field, None)
+            if val is not None:
+                d[field] = val
+
+        return d
+    
+    @staticmethod
+    def from_dict(d: dict) -> "Candle":
+        # Erkenne Zeitstempel-Feld: entweder 't' (API) oder 'timestamp' (lokale Aggregation)
+        if "t" in d:
+            ts = datetime.utcfromtimestamp(d["t"] / 1000)
+            o, h, l, c, v = d["o"], d["h"], d["l"], d["c"], d["v"]
+        elif "timestamp" in d:
+            ts = d["timestamp"]
+
+            if isinstance(ts, str):
+                ts = parser.isoparse(ts)
+            elif isinstance(ts, (int, float)):
+                if ts > 1e12:
+                    ts = datetime.utcfromtimestamp(ts / 1000)  # ms
+                else:
+                    ts = datetime.utcfromtimestamp(ts)
+            elif not isinstance(ts, (datetime, pd.Timestamp)):
+                raise ValueError(f"Ungültiger Timestamp: {ts}")
+
+            ts = pd.Timestamp(ts)
+            o, h, l, c, v = d["open"], d["high"], d["low"], d["close"], d["volume"]
+        else:
+            raise ValueError("Unbekanntes Candle-Format – weder 't' noch 'timestamp' gefunden")
+
+        return Candle(
+            timestamp=ts,
+            open=o,
+            high=h,
+            low=l,
+            close=c,
+            volume=v,
+            open_bid=d.get("open_bid"),
+            high_bid=d.get("high_bid"),
+            low_bid=d.get("low_bid"),
+            close_bid=d.get("close_bid"),
+            open_ask=d.get("open_ask"),
+            high_ask=d.get("high_ask"),
+            low_ask=d.get("low_ask"),
+            close_ask=d.get("close_ask"),
+        )
+
+
+
+
 
 def dicts_to_candles(dict_list: List[Dict[str, Any]]) -> List[Candle]:
     """
-    Wandelt eine Liste von Candle-Dicts aus der API/Aggregation in Candle-NamedTuples um.
+    Wandelt eine Liste von Candle-Dicts aus der API/Aggregation in Candle-Objekte um.
     Erwartet timestamp in ms.
+    Bid/Ask-Felder optional, default None.
     """
     return [
         Candle(
@@ -25,10 +127,19 @@ def dicts_to_candles(dict_list: List[Dict[str, Any]]) -> List[Candle]:
             high=item['high'],
             low=item['low'],
             close=item['close'],
-            volume=item['volume']
+            volume=item['volume'],
+            open_bid=item.get('open_bid'),
+            high_bid=item.get('high_bid'),
+            low_bid=item.get('low_bid'),
+            close_bid=item.get('close_bid'),
+            open_ask=item.get('open_ask'),
+            high_ask=item.get('high_ask'),
+            low_ask=item.get('low_ask'),
+            close_ask=item.get('close_ask'),
         )
         for item in dict_list
     ]
+
 
 # --------------------------------------------
 # Phase‑Enum
@@ -60,3 +171,4 @@ class PhaseRule(NamedTuple):
     from_phase: Phase
     to_phase: Phase
     condition: PhaseCondition
+
