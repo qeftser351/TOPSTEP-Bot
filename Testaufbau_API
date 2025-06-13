@@ -1,0 +1,61 @@
+#!/usr/bin/env python3
+import os
+import sys
+import requests
+from dotenv import load_dotenv, find_dotenv
+
+load_dotenv(find_dotenv(), override=True)
+
+def main():
+    # 1) User und Key aus den Umgebungsvariablen lesen
+    try:
+        API_USER = os.environ['API_USER']
+        API_KEY  = os.environ['API_KEY']
+    except KeyError as e:
+        print(f"❌ Umgebungsvariable {e.args[0]} fehlt")
+        sys.exit(1)
+
+    # 2) Basis‐URL definieren (Demo‐Gateway)
+    base_url   = "https://api.topstepx.com"
+    login_path = "/api/Auth/LoginKey"
+    url        = base_url.rstrip("/") + login_path
+
+    # 3) Payload zusammenbauen
+    payload = {
+        "userName": API_USER,
+        "apiKey":   API_KEY
+    }
+
+    print("→ Versuche, mich einzuloggen mit URL:", url)
+    print("→ Payload:", payload)
+
+    try:
+        r = requests.post(url, json=payload, timeout=10)
+        print("→ Request-URL:   ", r.request.url)
+        print("→ Request-Body:  ", r.request.body)
+        print("→ Request-Headers:", r.request.headers)
+        print("→ Response-JSON: ", r.json())
+    except requests.exceptions.RequestException as e:
+        print("❌ Verbindungskanal‐Fehler:", e)
+        sys.exit(1)
+
+    print("Statuscode:", r.status_code)
+    print("Antwort-Headers:", r.headers)
+    print("Antwort-Body:")
+    print(r.text)
+
+    # 4) Response robust auswerten
+    try:
+        data = r.json()
+    except ValueError:
+        print("❌ Ungültige Antwort (kein JSON)")
+        sys.exit(1)
+
+    if r.status_code == 200 and data.get("success"):
+        print(f"✅ Login erfolgreich. Token: {data['token']}")
+    else:
+        print(f"❌ Login fehlgeschlagen (Status {r.status_code}, errorCode {data.get('errorCode')})")
+        sys.exit(1)
+
+if __name__ == "__main__":
+    main()
