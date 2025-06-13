@@ -18,7 +18,7 @@ Zeitreihen-Logik:
 - Rückkehr e→b: wenn b-Grundrichtung von der bei Wechsel eingehaltenen abweicht.
 """
 from config.phase import Phase
-from core.types import Phase
+from core.candles import Phase
 
 # Zeiträume in Sekunden (API-unabhängig, Aggregation im Bot)
 K = 900   # Kontext-Zeiteinheit: 15 Minuten
@@ -109,14 +109,26 @@ def aggregate_candles(candles: list[dict], timeframe_seconds: int) -> list[dict]
     if not candles:
         return []
 
+    # Normalisierung des Timestamp-Schlüssels (z. B. aus "t")
+    if "timestamp" not in candles[0]:
+        for c in candles:
+            c["timestamp"] = c.pop("t")
+
     df = pd.DataFrame(candles)
 
-    # Wenn timestamp bereits ein String im ISO-Format ist:
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    if 'timestamp' not in df.columns:
+        raise ValueError("Input candles missing 'timestamp' key")
 
+    # ✅ ISO-Format oder ms → immer nach UTC konvertieren
+    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, unit='ms' if isinstance(df['timestamp'].iloc[0], (int, float)) else None)
     df.set_index('timestamp', inplace=True)
 
-    rule = f'{timeframe_seconds}S'
+    # ⬇ Debug: Eingangs-DataFrame
+    print(f"[DEBUG] Raw {timeframe_seconds}s DF:")
+    print(df.tail())
+
+    # Aggregation
+    rule = f"{timeframe_seconds}s"
     agg_dict = {
         'open': 'first',
         'high': 'max',
@@ -124,11 +136,26 @@ def aggregate_candles(candles: list[dict], timeframe_seconds: int) -> list[dict]
         'close': 'last',
         'volume': 'sum'
     }
-    df_agg = df.resample(rule, label='right', closed='right').agg(agg_dict).dropna().reset_index()
+    df_agg = df.resample(rule, label='left', closed='right').agg(agg_dict).dropna()
 
-    # zurück zu int-ms, wenn downstream das erwartet
+    print(f"[DEBUG] Aggregated {timeframe_seconds}s DF:")
+    print(df_agg.tail())
+
+    if df_agg.empty:
+        print(f"[Aggregator] WARNING: No candles aggregated for timeframe={timeframe_seconds}")
+        return []
+
+    # Zurück zu int-ms Timestamp
+    df_agg = df_agg.reset_index()
     df_agg['timestamp'] = (df_agg['timestamp'].astype('int64') // 10**6)
 
+    for row in df_agg.itertuples(index=False):
+        print(f"[Aggregator] Neue Kerze timeframe_seconds={timeframe_seconds}: "
+              f"timestamp={pd.to_datetime(row.timestamp, unit='ms')} "
+              f"open={row.open} high={row.high} low={row.low} close={row.close} volume={row.volume}")
+
     return df_agg.to_dict(orient='records')
+
+
 
 
