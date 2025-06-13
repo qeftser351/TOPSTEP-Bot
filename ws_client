@@ -1,0 +1,218 @@
+import asyncio
+import json
+import threading
+import websockets
+import time
+import threading
+import pandas as pd
+from datetime import datetime
+
+
+class BaseProjectXWebSocketClient:
+    def __init__(self, url, token, on_message):
+        self.url = url
+        self.token = token
+        self.on_message = on_message
+        self.ws = None
+        self.loop = asyncio.new_event_loop()
+        self._stop_event = asyncio.Event()   
+        self.thread = threading.Thread(target=self.run_loop, daemon=True)
+        self.thread.start()                   
+        self.reconnect_delay = 1
+
+
+    def run_loop(self):
+        asyncio.set_event_loop(self.loop)
+        try:
+            self.loop.run_until_complete(self.connect_loop())
+        except Exception as e:
+            print(f"[WS LOOP ERROR] {e}")
+        finally:
+            # Sauberes Schließen des Eventloops, wenn connect_loop beendet
+            self.loop.run_until_complete(self.loop.shutdown_asyncgens())
+            self.loop.close()
+
+
+    async def connect_loop(self):
+        while not self._stop_event.is_set():
+            try:
+                # 1) mit json-Subprotocol verbinden
+                async with websockets.connect(self.url, subprotocols=["json"]) as ws:
+                    self.ws = ws
+
+                    # 2) SignalR-Handshake
+                    await ws.send(json.dumps({"protocol": "json", "version": 1}) + "\x1e")
+                    # 3) ACK („{}“) weglesen
+                    await ws.recv()
+
+                    # 4) erst jetzt deine Subscriptions
+                    await self.subscribe()
+
+                    # 5) Heartbeat & Message-Loop
+                    self.reconnect_delay = 1
+                    heartbeat = asyncio.create_task(self.heartbeat())
+                    async for raw in ws:
+                        if self._stop_event.is_set():
+                            break
+                        await self.handle(raw)
+                    heartbeat.cancel()
+
+            except Exception as e:
+                print(f"[WS ERROR] {e}. reconnect in {self.reconnect_delay}s", flush=True)
+                await asyncio.sleep(self.reconnect_delay)
+                self.reconnect_delay = min(self.reconnect_delay * 2, 30)
+
+
+    
+    async def subscribe_symbol(self, symbol_id):
+        if symbol_id not in self.symbol_ids:
+            self.symbol_ids.append(symbol_id)
+            payload = {
+                "type": 1,
+                "target": "SubscribeContractQuotes",
+                "arguments": [symbol_id]
+            }
+
+            if self.ws is not None and not self.ws.closed:
+                try:
+                    await self.ws.send(json.dumps(payload) + "\x1e")
+                    print(f"[MarketWS] send subscribe → {payload}", flush=True)
+                except Exception as e:
+                    print(f"[WS ERROR] Send failed: {e} → {payload}", flush=True)
+            else:
+                print("[WS] WARN: ws ist None oder geschlossen – sende nicht", flush=True)
+
+
+    async def handle(self, message):
+        frames = message.split('\x1e')
+        for frame in frames:
+            if not frame.strip():
+                continue
+            try:
+                data = json.loads(frame)
+                await self.on_message(data)  # <--- await hier
+            except json.JSONDecodeError as e:
+                print(f"[WS PARSE ERROR] JSON decode error: {e} in frame: {frame}")
+
+
+
+    async def heartbeat(self):
+        while True:
+            try:
+                if self.ws is not None and not self.ws.closed:
+                    await self.ws.send(json.dumps({"type": 6}))
+                else:
+                    print("[WS] WARN: ws ist None oder geschlossen – heartbeat nicht gesendet")
+                await asyncio.sleep(15)
+            except websockets.exceptions.ConnectionClosedOK:
+                break
+            except Exception as e:
+                print(f"[WS HEARTBEAT ERROR] {e}")
+                break
+
+
+
+    def send(self, message: dict):
+        if self.ws is not None and not self.ws.closed:
+            try:
+                asyncio.run_coroutine_threadsafe(self.ws.send(json.dumps(message)), self.loop)
+            except Exception as e:
+                print(f"[WS ERROR] run_coroutine_threadsafe failed: {e}")
+        else:
+            print("[WS] WARN: ws ist None oder geschlossen – sende nicht")
+
+            
+    def stop(self):
+        # Signalisiere connect_loop, dass es stoppen soll
+        self.loop.call_soon_threadsafe(self._stop_event.set)
+    
+        # Schließe WebSocket-Verbindung (falls offen)
+        if self.ws and not self.ws.closed:
+            asyncio.run_coroutine_threadsafe(self.ws.close(), self.loop)
+    
+        # Warte auf Beendigung des Threads (der Eventloop läuft noch)
+        self.thread.join(timeout=5)
+
+
+
+class MarketWebSocketClient(BaseProjectXWebSocketClient):
+    def __init__(self, token, symbol_ids, on_quote):
+        # Token als Query-Parameter, Sub-Protocol "json"
+        url = f"wss://rtc.topstepx.com/hubs/market?access_token={token}"
+        super().__init__(url, token)
+        self.symbol_ids = symbol_ids
+        self.on_quote = on_quote
+        
+
+
+    async def subscribe(self):
+        for symbol_id in self.symbol_ids:
+            payload = {
+                "type": 1,
+                "target": "SubscribeContractQuotes",
+                "arguments": [symbol_id]
+            }
+
+            if self.ws is not None and not self.ws.closed:
+                try:
+                    await self.ws.send(json.dumps(payload) + "\x1e")
+                    print(f"[MarketWS] send subscribe → {payload}", flush=True)
+                except Exception as e:
+                    print(f"[WS ERROR] Send failed: {e} → {payload}", flush=True)
+            else:
+                print("[WS] WARN: ws ist None oder geschlossen – sende nicht", flush=True)
+
+
+
+
+
+class UserWebSocketClient(BaseProjectXWebSocketClient):
+    def __init__(self, token, account_id, on_event):
+        url = f"wss://rtc.topstepx.com/hubs/user?access_token={token}"
+        super().__init__(url, token, self.handle_message)
+        self.account_id = account_id
+        self.on_event = on_event
+        
+
+    async def subscribe(self):
+        subs = [
+            {"target": "SubscribeAccounts"},
+            {"target": "SubscribeOrders", "arguments": [self.account_id]},
+            {"target": "SubscribePositions", "arguments": [self.account_id]},
+            {"target": "SubscribeTrades", "arguments": [self.account_id]},
+        ]
+        for sub in subs:
+            sub["type"] = 1
+            if self.ws is not None and not self.ws.closed:
+                try:
+                    await self.ws.send(json.dumps(sub))
+                except Exception as e:
+                    print(f"[WS ERROR] Send failed: {e} → {sub}", flush=True)
+            else:
+                print("[WS] WARN: ws ist None oder geschlossen – sende nicht", flush=True)
+                
+    async def handle_message(self, message):
+        target = message.get("target")
+        args = message.get("arguments", [])
+
+        if target is None:
+            return  # ACKs, Heartbeats, etc. ignorieren
+
+        if not self.on_event:
+            return
+
+        if target == "GatewayUserOrder":
+            self.on_event("order", args[0])
+        elif target == "GatewayUserPosition":
+            self.on_event("position", args[0])
+        elif target == "GatewayUserTrade":
+            self.on_event("trade", args[0])
+        elif target == "GatewayUserAccount":
+            self.on_event("account", args[0])
+        else:
+            print(f"[UserWS][WARN] Unbekannter Message-Typ: {target}")
+
+
+  
+
+
