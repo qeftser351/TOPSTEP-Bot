@@ -16,9 +16,11 @@ Bot-Struktur:
   candle_aggregator.py
   data_handler.py
   strategy.py
+  .env
   Testaufbau_API.py
   ws_client_signalr.py
   ws_client.py
+ 
 
 
   {}launch.json
