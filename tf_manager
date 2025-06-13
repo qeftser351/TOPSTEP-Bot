@@ -18,7 +18,7 @@ from core.candles import dicts_to_candles
 from candle_aggregator import CandleAggregator
 from dateutil import parser
 from collections import defaultdict
-
+import numpy as np
 
 
 
@@ -260,10 +260,18 @@ class MultiTimeframeController:
 
         df = pd.DataFrame(raw)
         df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}, inplace=True)
-        df["timestamp"] = df["timestamp"].apply(lambda ts: (
-            datetime.utcfromtimestamp(ts / 1000) if isinstance(ts, (int, float))
-            else parser.isoparse(ts).replace(tzinfo=None)
-        ))
+
+        def parse_ts(ts):
+            if isinstance(ts, (int, float, np.integer)):
+                return pd.to_datetime(int(ts), unit='ms', utc=True).tz_convert(None)
+            elif isinstance(ts, str):
+                return pd.to_datetime(ts, utc=True).tz_convert(None)
+            elif isinstance(ts, (datetime, pd.Timestamp)):
+                return pd.to_datetime(ts, utc=True).tz_convert(None)
+            else:
+                raise TypeError(f"[fetch_history] Unsupported timestamp type: {type(ts)} → {ts}")
+
+        df["timestamp"] = df["timestamp"].apply(parse_ts)
 
         records = df.to_dict(orient="records")
         if unit * unit_number != tf_seconds:
@@ -284,6 +292,7 @@ class MultiTimeframeController:
             low_ask=c.get("low_ask"),
             close_ask=c.get("close_ask"),
         ) for c in records]
+
 
 
 
@@ -333,52 +342,53 @@ class MultiTimeframeController:
                     self.side          = 'buy' if p["side"].lower()=="buy" else 'sell'
                     self.break_even_applied[p["positionId"]]   = False
                     self.risk_mgr.trailing_levels[p["positionId"]] = 0
+                    
+            # 🔁 NEU: Trigger Aggregation höherer Timeframes ausgehend von E
+            self.try_aggregate_higher_timeframes(contract_id, candle.timestamp)
         
-            # 1. ***NEU: Alle Zeiteinheiten auf neue abgeschlossene Kerzen prüfen und ggf. updaten***
+        # Neue Candle? Update FSM, aber ohne fetch_history
         for tf_upd in (K, B):
             if tf_upd == tf:
-                continue  # Den aktuellen, schon gleich folgenden TF nicht doppelt behandeln
-            # Prüfe, ob in diesem TF seit dem letzten Update eine neue abgeschlossene Kerze vorliegt
-            last_hist = self.history.get(tf_upd, [])
-            last_ts = last_hist[-1].timestamp if last_hist else None
-            # Hole die neuesten Kerzen (Achtung: immer OHNE laufende Kerze)
-            new_hist = self.fetch_history(self.contract_id, tf_upd, get_history_limit(tf_upd))[:-1]
-            ts = new_hist[-1].timestamp
-            if isinstance(ts, int):
-                ts = datetime.fromtimestamp(ts / 1000)  # ms -> s
+                continue  # aktuelle TF überspringen
 
-            if last_ts is not None and isinstance(last_ts, int):
-                last_ts = datetime.fromtimestamp(last_ts / 1000)
+            history = self.data.histories.get(contract_id, {}).get(tf_upd, [])
+            if not history:
+                continue
 
-            if new_hist and (not last_ts or ts > last_ts):
-                self.history[tf_upd] = new_hist
-                self.machines[tf_upd].context['last_candles'] = new_hist
-                new_phase = self.machines[tf_upd].update(new_hist)
+            latest = history[-1]
+            last_ts = self.last_update_ts.get(tf_upd)
+
+            # Nur wenn neue Kerze eingetroffen ist
+            if last_ts is None or latest.timestamp > last_ts:
+                self.machines[tf_upd].context["last_candles"] = history
+                new_phase = self.machines[tf_upd].update(history)
                 self.phases[tf_upd] = new_phase
-                self.machines[tf_upd].context['prev_phase'] = new_phase
-                self.last_update_ts[tf_upd] = new_hist[-1].timestamp
-                # Optional: Switch-Daten aktualisieren, falls Phase relevant
+                self.machines[tf_upd].context["prev_phase"] = new_phase
+                self.last_update_ts[tf_upd] = latest.timestamp
+
+                # Optional: Switch-Daten aktualisieren
                 ctx = self.machines[tf_upd].context
                 if new_phase == Phase.BASE_SWITCH_BULL:
                     self.switch_data[tf_upd] = {
-                        'initial_extreme': ctx.get('switch_bull_initial_low'),
-                        'previous_extreme': ctx.get('switch_bull_prev_higher_high')
+                        "initial_extreme": ctx.get("switch_bull_initial_low"),
+                        "previous_extreme": ctx.get("switch_bull_prev_higher_high"),
                     }
                 elif new_phase == Phase.BASE_SWITCH_BEAR:
                     self.switch_data[tf_upd] = {
-                        'initial_extreme': ctx.get('switch_bear_initial_high'),
-                        'previous_extreme': ctx.get('switch_bear_prev_lower_low')
+                        "initial_extreme": ctx.get("switch_bear_initial_high"),
+                        "previous_extreme": ctx.get("switch_bear_prev_lower_low"),
                     }
                 elif new_phase == Phase.SWITCH_BULL:
                     self.switch_data[tf_upd] = {
-                        'initial_extreme': ctx.get('switch_bull_initial_low'),
-                        'previous_extreme': ctx.get('switch_bull_prev_higher_high')
+                        "initial_extreme": ctx.get("switch_bull_initial_low"),
+                        "previous_extreme": ctx.get("switch_bull_prev_higher_high"),
                     }
                 elif new_phase == Phase.SWITCH_BEAR:
                     self.switch_data[tf_upd] = {
-                        'initial_extreme': ctx.get('switch_bear_initial_high'),
-                        'previous_extreme': ctx.get('switch_bear_prev_lower_low')
+                        "initial_extreme": ctx.get("switch_bear_initial_high"),
+                        "previous_extreme": ctx.get("switch_bear_prev_lower_low"),
                     }
+
                 
                 # Direkt nach jedem neuen K-Update prüfen:
                 if tf_upd == K and self.active_tf == K and can_k_to_b(self.phases[K]):
@@ -883,48 +893,66 @@ class MultiTimeframeController:
 
 
     def print_summary(self) -> None:
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now}] {self.symbol} summary:")
-        entry, sl, rr = None, None, None  # Platzhalter für CSV
+        now_dt = None
+        if self.history.get(self.active_tf):
+            last = self.history[self.active_tf][-1]
+            ts = last.timestamp
+            if isinstance(ts, (int, float, np.integer)):
+                ts = pd.to_datetime(int(ts), unit='ms' if ts > 1e12 else 's', utc=True)
+            else:
+                ts = pd.to_datetime(ts, utc=True)
+            now_dt = ts.tz_convert("Europe/Berlin")
+        now_str = now_dt.strftime("%Y-%m-%d %H:%M:%S") if now_dt else datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        print(f"[{now_str}] {self.symbol} summary:")
+        entry, sl, rr = None, None, None
+
         for tf in (K, B, E):
             lbl = {K: '15m', B: '3m', E: '15s'}[tf]
             phase = self.phases.get(tf)
             act = '*' if tf == self.active_tf else ''
             line = f"  {lbl}{act}: {phase.name if phase else 'N/A'}"
-        
+
             history = self.history.get(tf)
             if history and len(history) >= 20:
                 close_prices = pd.Series([getattr(c, EMA_SOURCE) for c in history])
                 ema_10 = _ema(close_prices, 10)
                 ema_20 = _ema(close_prices, 20)
                 last_candle = history[-1]
-            
                 ts = last_candle.timestamp
-                if isinstance(ts, (int, float)):
-                    # Timestamp evtl. in Millisekunden, dann in Sekunden konvertieren
-                    if ts > 1e12:
-                        ts = ts / 1000
-                    dt = datetime.utcfromtimestamp(ts)
+
+                # ✅ Zeit robust parsen + Berliner Zeit
+                if isinstance(ts, (int, float, np.integer)):
+                    ts = pd.to_datetime(int(ts), unit='ms' if ts > 1e12 else 's', utc=True)
                 else:
-                    dt = ts  # evtl. schon datetime-Objekt
-            
-                line += f" | last_candle: {dt.strftime('%Y-%m-%d %H:%M:%S')} | EMA10={ema_10:.5f} EMA20={ema_20:.5f}"
+                    ts = pd.to_datetime(ts, utc=True)
+                ts = ts.tz_convert("Europe/Berlin")
+
+                line += f" | last_candle: {ts.strftime('%Y-%m-%d %H:%M:%S')} | EMA10={ema_10:.5f} EMA20={ema_20:.5f}"
             else:
                 line += " | EMA10/20: n/a"
-        
+
             if phase == Phase.SWITCH_BULL:
                 d = self.switch_data.get(tf, {})
                 line += f" | initLow={d.get('initial_extreme')} prevHigh={d.get('previous_extreme')}"
             if phase == Phase.SWITCH_BEAR:
                 d = self.switch_data.get(tf, {})
                 line += f" | initHigh={d.get('initial_extreme')} prevLow={d.get('previous_extreme')}"
-        
-            # Weitere Logik für offene Orders/Positionen (unverändert)
+
             if tf == E and self.open_ticket is not None:
-                has_order = any(o["orderId"] == self.open_ticket for o in self.api.get_open_orders(self.account_id) if o.get("customTag") == "234000")
-                has_pos = any(p["positionId"] == self.open_ticket for p in self.api.get_positions(self.account_id) if p.get("customTag") == "234000")
+                has_order = any(
+                    o["orderId"] == self.open_ticket
+                    for o in self.api.get_open_orders(self.account_id)
+                    if o.get("customTag") == "234000"
+                )
+                has_pos = any(
+                    p["positionId"] == self.open_ticket
+                    for p in self.api.get_positions(self.account_id)
+                    if p.get("customTag") == "234000"
+                )
                 if has_order or has_pos:
-                    rr = (abs(self.entry_price - self.initial_stop) if self.entry_price and self.initial_stop else None)
+                    rr = (abs(self.entry_price - self.initial_stop)
+                        if self.entry_price and self.initial_stop else None)
                     line += f" | entry={self.entry_price:.5f}, sl={self.initial_stop:.5f}"
                     if rr is not None:
                         line += f", 1RR={rr:.5f}"
@@ -934,7 +962,7 @@ class MultiTimeframeController:
                     self.initial_stop = None
                     self.current_sl = None
                     self.side = None
-        
+
             print(line)
 
             
