@@ -25,10 +25,9 @@ class MarketWSClient:
         self.on_candle = candle_handler
         self.contract_id_to_name = contract_id_to_name or {}
         self.latest_quotes = {}
-        self.on_new_candle = on_new_candle
-        self.name_to_contract_id = {v: k for k, v in self.contract_id_to_name.items()}
+
         
-        self._quote_buffers = {}
+
         self.tf_manager = None
 
         self.hub_url = f"wss://rtc.topstepx.com/hubs/market?access_token={token}"
@@ -75,6 +74,8 @@ class MarketWSClient:
             print(f"[MarketWS][ERROR] Ungültiger Timestamp: {ts_str} – {e}")
             return
 
+        timestamp_ms = int(ts.timestamp() * 1000) 
+
         self.latest_quotes[contract_id] = {"bid": bid, "ask": ask, "timestamp": ts}
 
         if self.quote_handler:
@@ -96,115 +97,19 @@ class MarketWSClient:
                     "close_ask": ask,
                 }
                 candle = Candle(**candle_dict)
-                self.quote_handler(contract_id, ts, bid, ask)
+
+                # ⛏️ WICHTIG: timestamp in Millisekunden
+                timestamp_ms = int(ts.timestamp() * 1000)
+
+                self.quote_handler(contract_id, timestamp_ms, bid, ask)
             except Exception as e:
                 print(f"[MarketWS][ERROR] Quote-Handler Exception: {e}")
 
 
-    def _on_quote(self, contract_id: str, data: dict):
-        bid = data.get("bestBid")
-        ask = data.get("bestAsk")
-        timestamp_iso = data.get("timestamp")
 
-        if not timestamp_iso:
-            print(f"[MarketWS][WARN] Ungültiger Timestamp: {data}")
-            return
-
-        try:
-            ts = pd.to_datetime(timestamp_iso)
-        except Exception as e:
-            print(f"[MarketWS][ERROR] Ungültiger Timestamp {timestamp_iso}: {e}")
-            return
-
-        symbol = self.contract_id_to_name.get(contract_id, contract_id)
-
-        # 🔁 Quote-Heilung per Cache
-        if not hasattr(self, "last_bid"):
-            self.last_bid = {}
-            self.last_ask = {}
-
-        if bid is None:
-            bid = self.last_bid.get(symbol)
-        else:
-            self.last_bid[symbol] = bid
-
-        if ask is None:
-            ask = self.last_ask.get(symbol)
-        else:
-            self.last_ask[symbol] = ask
-
-        if bid is None or ask is None:
-            print(f"[MarketWS][WARN] Kein gültiger Bid/Ask für {symbol} → {data}")
-            return
-
-        self._quote_to_candle(symbol, ts, bid, ask)
 
         
-    def _quote_to_candle(self, symbol: str, ts, bid: float, ask: float):
-        # 🔒 Timestamp-Konvertierung
-        if isinstance(ts, str):
-            ts = parser.isoparse(ts).replace(tzinfo=None)
-        elif isinstance(ts, (int, float)):
-            ts = datetime.utcfromtimestamp(ts)
-        if not isinstance(ts, pd.Timestamp):
-            ts = pd.Timestamp(ts)
-        if ts.tzinfo is not None:
-            ts = ts.tz_convert(None)
 
-        price = bid  # oder (bid + ask) / 2
-        interval = ts.floor("15s")
-
-        buf = self._quote_buffers.setdefault(symbol, {
-            "current_candle": None,
-            "last_interval": None,
-        })
-
-        if buf["last_interval"] != interval:
-            if isinstance(buf["current_candle"], Candle):
-                contract_id = self.name_to_contract_id.get(symbol)
-                if not contract_id:
-                    print(f"[ERROR] Kein contract_id für Symbol {symbol}")
-                    return
-                self._on_new_15s_candle(contract_id, 15, buf["current_candle"])
-
-
-            buf["current_candle"] = Candle(
-                timestamp=interval.to_pydatetime(),
-                open=price,
-                high=price,
-                low=price,
-                close=price,
-                volume=1
-            )
-            buf["last_interval"] = interval
-        else:
-            c = buf["current_candle"]
-            if not isinstance(c, Candle):
-                print(f"[ERROR] Expected Candle, got {type(c)}: {c}")
-                return
-            c.high = max(c.high, price)
-            c.low = min(c.low, price)
-            c.close = price
-            c.volume += 1
-
-
-
-
-
-    def _on_new_15s_candle(self, symbol: str, candle):
-        if isinstance(candle, dict):
-            candle = Candle.from_dict(candle)
-        elif not isinstance(candle, Candle):
-            print(f"[ERROR] Ungültiger Candle-Typ: {type(candle)} → {candle}")
-            return
-
-        print(f"[15s-Candle] {symbol} @ {candle.timestamp} | O={candle.open} H={candle.high} L={candle.low} C={candle.close}")
-
-        if self.on_new_candle:
-            print(f"[DISPATCH] Trigger → {symbol} | on_new_candle vorhanden")
-            self.on_new_candle(symbol, 15, candle)
-        else:
-            print(f"[MarketWS] ⚠ Kein on_new_candle-Handler gesetzt für {symbol}")
 
 
 
