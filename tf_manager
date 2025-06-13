@@ -4,7 +4,7 @@ from typing import Dict, List, Optional
 from datetime import datetime
 from config.timeframes import K, B, E, get_history_limit, can_k_to_b, can_b_to_e
 from core.phase_manager import PhaseStateMachine
-from core.types import Candle, Phase
+from core.candles import Candle, Phase
 from core.entry_manager import EntryLogicManager
 from core.risk_manager import RiskManager
 import logging
@@ -13,6 +13,11 @@ import os
 import math
 from data_handler import DataHandler
 from datetime import datetime, timedelta
+from config.timeframes import aggregate_candles
+from core.candles import dicts_to_candles
+from candle_aggregator import CandleAggregator
+from dateutil import parser
+from collections import defaultdict
 
 
 
@@ -60,24 +65,31 @@ def _ema(series: pd.Series, period: int) -> float:
 class MultiTimeframeController:
     def __init__(
         self,
-        symbol: str,
+        symbol: str,                # z. B. "YMM5"
         api: ProjectXAPI,
         account_id: int,
         account_balance: float,
         tick_size: float,
         spread: float,
         data_handler: DataHandler,
+        contract_id: str           # UUID (z. B. "8f83a1b4-...")
     ):
-
-        #neue API
         self.api = api
         self.account_id = account_id
-        self.symbol = symbol
+        self.symbol = symbol                   # z. B. "YMM5"
+        self.contract_id = contract_id         # z. B. UUID
         self.spread = spread
         self.tick_size = tick_size
         self.data = data_handler
+        self.last_agg_ts: Dict[str, Dict[int, int]] = {}
 
+        self.live_quote: Optional[Dict[str, float]] = None
 
+        # API-Zugriff auf Basis der UUID (korrekt)
+        self.contract = self.api.get_contract_details_by_id(self.contract_id)
+        self.stop_level = self.contract.get("tradeStopsLevel", 0)
+        
+        self._pending_to_position = defaultdict(dict)
 
 
         # Basis-Konfiguration
@@ -151,7 +163,7 @@ class MultiTimeframeController:
         # Lade History & Phasen
         MIN_CANDLES = 10
         for tf in (E, B, K):
-            raw = self.data.fetch_history(self.symbol, tf, get_history_limit(tf))
+            raw = self.data.fetch_history(self.contract_id, tf, get_history_limit(tf))
             hist = raw[:-1]
             fsm = self.machines[tf]
             fsm.reset()
@@ -218,43 +230,62 @@ class MultiTimeframeController:
     
     #API-RDY
     def fetch_history(self, symbol: str, tf_seconds: int, limit: int) -> list[Candle]:
-
-
         end_time = datetime.utcnow()
         start_time = end_time - timedelta(seconds=tf_seconds * limit)
 
+        if tf_seconds % 3600 == 0:
+            unit = 3
+            unit_number = tf_seconds // 3600
+        elif tf_seconds % 60 == 0:
+            unit = 2
+            unit_number = tf_seconds // 60
+        else:
+            unit = 1
+            unit_number = tf_seconds
+
         raw = self.api.get_candles(
             contract_id=symbol,
-            unit=1,              # 1=Sekunden
-            unit_number=15,      # 15 Sekunden
-            limit=limit * (tf_seconds // 15),
+            unit=unit,
+            unit_number=unit_number,
+            limit=limit,
             live=False,
             start_time=start_time,
             end_time=end_time,
             include_partial_bar=False
         )
 
-        # Keys umbenennen für Aggregation
-        df = pd.DataFrame(raw)
-        df.rename(columns={
-            "t": "timestamp",
-            "o": "open",
-            "h": "high",
-            "l": "low",
-            "c": "close",
-            "v": "volume"
-        }, inplace=True)
+        if not raw:
+            print(f"[ERROR] Keine historischen Kerzen empfangen für {symbol} @ {tf_seconds}s")
+            return []
 
-        from config.timeframes import aggregate_candles
-        agg = aggregate_candles(df.to_dict(orient="records"), tf_seconds)
-        
-        
+        df = pd.DataFrame(raw)
+        df.rename(columns={"t": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume"}, inplace=True)
+        df["timestamp"] = df["timestamp"].apply(lambda ts: (
+            datetime.utcfromtimestamp(ts / 1000) if isinstance(ts, (int, float))
+            else parser.isoparse(ts).replace(tzinfo=None)
+        ))
+
+        records = df.to_dict(orient="records")
+        if unit * unit_number != tf_seconds:
+            from config.timeframes import aggregate_candles
+            records = aggregate_candles(records, tf_seconds)
+
         return [Candle(
             timestamp=c["timestamp"],
             open=c["open"], high=c["high"],
             low=c["low"], close=c["close"],
-            volume=c["volume"]
-        ) for c in agg]
+            volume=c["volume"],
+            open_bid=c.get("open_bid"),
+            high_bid=c.get("high_bid"),
+            low_bid=c.get("low_bid"),
+            close_bid=c.get("close_bid"),
+            open_ask=c.get("open_ask"),
+            high_ask=c.get("high_ask"),
+            low_ask=c.get("low_ask"),
+            close_ask=c.get("close_ask"),
+        ) for c in records]
+
+
 
 
     #API-RDY
@@ -268,28 +299,22 @@ class MultiTimeframeController:
         return None
 
 
-    def on_new_candle(self, tf: int, candle: Candle) -> None:
-        if not hasattr(self, "contract_id_map"):
-            self.contract_id_map = {}
+    def on_new_candle(self, contract_id: str, tf: int, candle):
+        assert isinstance(candle, Candle), f"Ungültiger Candle-Typ: {type(candle)} → {candle}"
 
-        # Wenn self.symbol contractId ist, nutze get_contract_details_by_id direkt
-        if self.symbol not in self.contract_id_map:
-            # Wenn du nur symbolische Namen hast, löse zuerst auf:
-            # contract = self.api.get_contract_by_name(self.symbol)
-            # self.contract_id_map[self.symbol] = contract["id"]
-        
-            # Wenn self.symbol schon contractId ist, speichere es direkt:
-            self.contract_id_map[self.symbol] = self.symbol
+        print(f"[TFManager] Trigger: symbol={self.symbol} timeframe={tf} @ {candle.timestamp} OHLC={candle.open}/{candle.high}/{candle.low}/{candle.close}")
+    
+        if tf == E:
+            quote = self.api.get_current_price(self.symbol)
+            bid = quote.get("bid")
+            ask = quote.get("ask")
 
-        contract_id = self.contract_id_map[self.symbol]
+            if bid is None or ask is None:
+                print(f"[WARN] No bid/ask for {self.symbol}")
+            else:
+                print(f"[{tf}] Entry-Candle: {candle.timestamp} | bid={bid} ask={ask}")
 
-        contract = self.api.get_contract_details_by_id(contract_id)
-        stop_level = contract.get("tradeStopsLevel", 0)
-        tick_size = contract.get("tickSize", self.tick_size)
 
-        quote = self.api.get_quote(contract_id=contract_id)
-        ask = quote.get("ask")
-        bid = quote.get("bid")
 
 
         
@@ -317,7 +342,7 @@ class MultiTimeframeController:
             last_hist = self.history.get(tf_upd, [])
             last_ts = last_hist[-1].timestamp if last_hist else None
             # Hole die neuesten Kerzen (Achtung: immer OHNE laufende Kerze)
-            new_hist = self.fetch_history(self.symbol, tf_upd, get_history_limit(tf_upd))[:-1]
+            new_hist = self.fetch_history(self.contract_id, tf_upd, get_history_limit(tf_upd))[:-1]
             ts = new_hist[-1].timestamp
             if isinstance(ts, int):
                 ts = datetime.fromtimestamp(ts / 1000)  # ms -> s
@@ -591,7 +616,7 @@ class MultiTimeframeController:
             contract_id = self.contract_id_map[self.symbol]
 
             # Quote per Contract-ID holen
-            quote = self.api.get_quote(contract_id=contract_id)
+            quote = self.api.get_current_price(contract_id)
             ask = quote.get("ask")
             bid = quote.get("bid")
 
@@ -654,21 +679,23 @@ class MultiTimeframeController:
 
 
 
-        # 10) Cleanup nach Trade-Close für ALLE nicht mehr aktive Tickets API-RDY
+        # 10) Cleanup nach Trade-Close für ALLE nicht mehr aktive Tickets
         aktive_tickets = set(pos["positionId"] for pos in self.api.get_positions(self.account_id))
-        # Entferne alle Einträge, deren Ticket nicht mehr offen ist
+
+        # _pending_to_position cleanup
+        if symbol in self.data._pending_to_position:
+            for ticket in list(self.data._pending_to_position[symbol].keys()):
+                if ticket not in aktive_tickets:
+                    self.data._pending_to_position[symbol].pop(ticket, None)
+            if not self.data._pending_to_position[symbol]:
+                self.data._pending_to_position.pop(symbol)
+
+        # weitere per-Ticket Cleanups
         for ticket in list(self.entry_timestamps.keys()):
             if ticket not in aktive_tickets:
                 self.entry_timestamps.pop(ticket, None)
                 self.break_even_applied.pop(ticket, None)
                 self.risk_mgr.trailing_levels.pop(ticket, None)
-        # Optional: auch _pending_to_position sauberhalten
-        if self.symbol in self.data._pending_to_position:
-            for ticket in list(self.data._pending_to_position[self.symbol].keys()):
-                if ticket not in aktive_tickets:
-                    self.data._pending_to_position[self.symbol].pop(ticket, None)
-            if not self.data._pending_to_position[self.symbol]:
-                self.data._pending_to_position.pop(self.symbol)
 
 
 
@@ -695,7 +722,7 @@ class MultiTimeframeController:
         stop_level = contract.get("tradeStopsLevel", 0)
         tick_size = contract.get("tickSize", self.tick_size)  # fallback
 
-        quote = self.api.get_quote(contract_id=contract_id)
+        quote = self.api.get_current_price(contract_id)
         ask = quote.get("ask")
         bid = quote.get("bid")
 
@@ -711,6 +738,31 @@ class MultiTimeframeController:
             entry = self.entry_mgr.check_sell_stop(buf, bid, stop_level, tick_size)
         if entry:
             self._open_new_trade(entry)
+            
+    def try_aggregate_higher_timeframes(self, contract_id: str, last_15s_ts: datetime):
+        buffer = self.data.histories.get(contract_id, {}).get(15, [])
+        if len(buffer) < 12:
+            return
+
+        candles_raw = [c.to_dict() for c in buffer]
+
+        for target_tf in [180, 900]:  # 3m, 15m
+            aligned_ts = int(last_15s_ts.timestamp()) - (int(last_15s_ts.timestamp()) % target_tf)
+
+            if self.last_agg_ts.get(contract_id, {}).get(target_tf) == aligned_ts:
+                continue  # Schon aggregiert
+
+            aggregated = aggregate_candles(candles_raw, target_tf)
+            candles = dicts_to_candles(aggregated)
+
+            for c in candles:
+                if int(c.timestamp.timestamp()) == aligned_ts:
+                    self.last_agg_ts.setdefault(contract_id, {})[target_tf] = aligned_ts
+                    self.on_new_candle(contract_id, target_tf, c)
+
+
+
+
             
     def _sync_ticket_state_with_api(self):
         """Synchronisiere Ticket-State nach FSM-Reset oder Replay."""
@@ -781,7 +833,7 @@ class MultiTimeframeController:
 
 
     def _switch_to(self, tf: int) -> None:
-        raw_hist = self.fetch_history(self.symbol, tf, get_history_limit(tf))
+        raw_hist = self.fetch_history(self.contract_id, tf, get_history_limit(tf))
         hist = raw_hist[:-1]
         if not hist or len(hist) < 3:
             return
@@ -810,14 +862,15 @@ class MultiTimeframeController:
 
 
     def _record_switch(self, tf: int, buf: List[Candle], extreme: str) -> None:
-        data=self.switch_data.get(tf,{})
-        if extreme=='low':
-            initial=data.get('initial_low')
-            prev   =data.get('prev_higher_high')
+        ctx = self.machines[tf].context
+        if extreme == 'low':
+            initial = ctx.get('switch_bull_initial_low')
+            prev = ctx.get('switch_bull_prev_higher_high')
         else:
-            initial=data.get('initial_high')
-            prev   =data.get('prev_lower_low')
-        self.switch_data[tf]={'initial_extreme':initial,'previous_extreme':prev}
+            initial = ctx.get('switch_bear_initial_high')
+            prev = ctx.get('switch_bear_prev_lower_low')
+        self.switch_data[tf] = {'initial_extreme': initial, 'previous_extreme': prev}
+
         
     def _has_active_trade(self) -> bool:
         open_pos = [ p for p in self.api.get_positions(self.account_id) if p.get("customTag")=="234000" ]
@@ -894,3 +947,22 @@ class MultiTimeframeController:
 
     def stop(self) -> None:
         self.api.logout()
+
+
+if __name__ == "__main__":
+    # Initialisierung, Instanzen, Subscription, etc.
+    api = ProjectXAPI(...)
+    account_id = 123456
+    symbol = "CON.1234"
+    contract_id = symbol
+    timeframe = 15
+    balance = 10000.0
+    tick_size = 0.01
+    spread = 0.02
+    token = "YOUR_WS_API_TOKEN"
+
+    handler = DataHandler(api, account_id)
+    strategy = MultiTimeframeController(symbol, api, account_id, balance, tick_size, spread, handler)
+
+    handler.subscribe_candles(contract_id, timeframe, lambda candle: strategy.on_new_candle(timeframe, candle))
+    handler.start_ws(token, [contract_id])
