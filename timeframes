@@ -19,6 +19,8 @@ Zeitreihen-Logik:
 """
 from config.phase import Phase
 from core.candles import Phase
+import numpy as np
+
 
 # Zeiträume in Sekunden (API-unabhängig, Aggregation im Bot)
 K = 900   # Kontext-Zeiteinheit: 15 Minuten
@@ -104,26 +106,52 @@ def get_history_limit(tf: int) -> int:
 # --- Aggregations-Utility für Custom-Kerzen (z. B. in deinem Datenhandler nutzen) ---
 
 import pandas as pd
+from datetime import datetime
 
 def aggregate_candles(candles: list[dict], timeframe_seconds: int) -> list[dict]:
     if not candles:
         return []
 
-    # Normalisierung des Timestamp-Schlüssels (z. B. aus "t")
+    # Normalisierung des Timestamp-Schlüssels
     if "timestamp" not in candles[0]:
         for c in candles:
             c["timestamp"] = c.pop("t")
 
     df = pd.DataFrame(candles)
+    
+    if 'o' in df.columns:
+        df.rename(columns={
+            "o": "open", "h": "high", "l": "low",
+            "c": "close", "v": "volume"
+        }, inplace=True)
+
 
     if 'timestamp' not in df.columns:
         raise ValueError("Input candles missing 'timestamp' key")
 
-    # ✅ ISO-Format oder ms → immer nach UTC konvertieren
-    df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, unit='ms' if isinstance(df['timestamp'].iloc[0], (int, float)) else None)
+    # ✅ Robust: Konvertiere timestamps → pd.Timestamp (UTC)
+    sample_ts = df['timestamp'].iloc[0]
+    if isinstance(sample_ts, (int, float, np.integer)):
+        unit = 's' if sample_ts < 1e10 else 'ms'
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, unit=unit)
+    elif isinstance(sample_ts, str):
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    elif isinstance(sample_ts, (datetime, pd.Timestamp)):
+        df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+    else:
+        raise TypeError(f"[aggregate_candles] Unsupported timestamp format: {type(sample_ts)} → {sample_ts}")
+
     df.set_index('timestamp', inplace=True)
 
-    # ⬇ Debug: Eingangs-DataFrame
+    # ✅ Spalten-Validierung vor Aggregation
+    required_cols = {'open', 'high', 'low', 'close', 'volume'}
+    missing = required_cols - set(df.columns)
+    if missing:
+        print(f"[ERROR] aggregate_candles → Missing required columns: {missing}")
+        print(f"[DEBUG] Aktuelle Spalten im DF: {df.columns.tolist()}")
+        raise ValueError(f"[aggregate_candles] Cannot aggregate – missing columns: {missing}")
+
+    # Optionales Debugging
     print(f"[DEBUG] Raw {timeframe_seconds}s DF:")
     print(df.tail())
 
@@ -138,23 +166,31 @@ def aggregate_candles(candles: list[dict], timeframe_seconds: int) -> list[dict]
     }
     df_agg = df.resample(rule, label='left', closed='right').agg(agg_dict).dropna()
 
-    print(f"[DEBUG] Aggregated {timeframe_seconds}s DF:")
-    print(df_agg.tail())
-
     if df_agg.empty:
         print(f"[Aggregator] WARNING: No candles aggregated for timeframe={timeframe_seconds}")
         return []
 
-    # Zurück zu int-ms Timestamp
-    df_agg = df_agg.reset_index()
-    df_agg['timestamp'] = (df_agg['timestamp'].astype('int64') // 10**6)
+    print(f"[DEBUG] Aggregated {timeframe_seconds}s DF:")
+    print(df_agg.tail())
 
+    # Rückkonvertierung: UTC-Timestamps in int(ms)
+    df_agg = df_agg.reset_index()
+    df_agg['timestamp'] = (df_agg['timestamp'].astype('int64') // 10**6).astype(int)
+
+    # Debug-Log vor der Rückgabe
     for row in df_agg.itertuples(index=False):
         print(f"[Aggregator] Neue Kerze timeframe_seconds={timeframe_seconds}: "
               f"timestamp={pd.to_datetime(row.timestamp, unit='ms')} "
               f"open={row.open} high={row.high} low={row.low} close={row.close} volume={row.volume}")
 
-    return df_agg.to_dict(orient='records')
+    # Rückgabe mit explizitem Cast der Timestamp-Werte
+    candles = df_agg.to_dict(orient='records')
+    return candles
+
+
+
+
+
 
 
 
