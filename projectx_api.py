@@ -26,12 +26,22 @@ class ProjectXAPI:
         self.api_key = api_key
         self.token = None
         self.token_timestamp = 0
-        self.token_lifetime = 60 * 60 * 23  # 23 Stunden, konservativ
+        self.token_lifetime = 60 * 60 * 23
+        self.token_file = "session_token.json"
         self.session = requests.Session()
         self._last_api_call_time = 0
         self.ws_client = None
 
-        self._retry_authenticate_with_backoff()
+        # Nur dann authentifizieren, wenn kein gültiger Token geladen wurde
+        if not self._load_token_from_file():
+            self._retry_authenticate_with_backoff()
+        else:
+            self.session.headers.update({
+                "Authorization": f"Bearer {self.token}",
+                "Content-Type": "application/json"
+            })
+
+
 
     def attach_ws_client(self, ws_client):
         self.ws_client = ws_client
@@ -65,6 +75,9 @@ class ProjectXAPI:
             raise Exception(f"Authentication failed (errorCode={ec})")
         self.token = data["token"]
         self.token_timestamp = time.time()
+        
+        # Persistenz sichern
+        self._save_token_to_file()
         
         # Header zentral für alle folgenden Requests setzen
         self.session.headers.update({
@@ -108,6 +121,37 @@ class ProjectXAPI:
                     raise
             raise RuntimeError(f"API-Request fehlgeschlagen nach {max_retries} Versuchen")
         return wrapper
+    
+    
+    def _load_token_from_file(self, path="session_token.json"):
+        if not os.path.exists(path):
+            return False
+        try:
+            with open(path, "r") as f:
+                token_data = json.load(f)
+            if token_data["username"] != self.username:
+                print("[WARN] Token-Datei gehört zu anderem Benutzer – ignoriere sie.")
+                return False
+            self.token = token_data["token"]
+            self.token_timestamp = token_data["timestamp"]
+            if self.token_is_valid():
+                print(f"[INFO] Gültiger Token aus Datei geladen.")
+                return True
+            else:
+                print(f"[INFO] Token aus Datei ist abgelaufen.")
+                return False
+        except Exception as e:
+            print(f"[WARN] Fehler beim Laden des Tokens: {e}")
+            return False
+        
+        
+    def clear_token_file(self):
+        try:
+            os.remove(self.token_file)
+            print("[INFO] Token-Datei gelöscht.")
+        except FileNotFoundError:
+            pass
+
 
 
     
@@ -133,6 +177,14 @@ class ProjectXAPI:
                 else:
                     raise RuntimeError(f"Login fehlgeschlagen nach {retries} Versuchen: {e}")
 
+    def _save_token_to_file(self, path="session_token.json"):
+        token_data = {
+            "token": self.token,
+            "timestamp": self.token_timestamp,
+            "username": self.username
+        }
+        with open(path, "w") as f:
+            json.dump(token_data, f)
 
         
     #Welche Konten gibt es
