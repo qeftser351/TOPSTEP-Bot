@@ -1,18 +1,18 @@
-# main.py
-
 import os
-import threading
 import signal
 import sys
+import time
+import threading
 from dotenv import load_dotenv, find_dotenv
+from typing import Dict
+from datetime import datetime
+from core.candles import Candle
 
 from projectx_api import ProjectXAPI
 from data_handler import DataHandler
 from strategy import TradingStrategy
 from config.timeframes import K, B, E
-from typing import Dict
-import threading
-import time
+from ws_client import UserWebSocketClient
 
 load_dotenv(find_dotenv(), override=True)
 
@@ -30,134 +30,147 @@ def start_periodic_summary(strategies: Dict[str, TradingStrategy], interval: int
 
 def shutdown(signum, frame):
     print("\nStop signal received, shutting down …")
-    try:
-        handler.stop()
-    except Exception:
-        pass
+    try: handler.stop()
+    except Exception: pass
+    try: handler.ws_client.stop()
+    except Exception: pass
+    try: user_client.stop()
+    except Exception: pass
     sys.exit(0)
 
-def resolve_contract_id_by_name(api: ProjectXAPI, symbol_name: str):
-    contracts = api.search_contracts(search_text=symbol_name)
-    if not contracts:
-        raise ValueError(f"Kein Contract mit Bezug zu '{symbol_name}' gefunden.")
-
-    for c in contracts:
-        if symbol_name.lower() in (c.get("name", "").lower(), c.get("description", "").lower(), c.get("id", "").lower()):
-            return c
-
-    print(f"⚠️ Kein exakter Treffer für '{symbol_name}', Rückfall auf ersten Eintrag.")
-    return contracts[0]
-
+def parse_expiry(name):
+    month_map = {"F": 1, "G": 2, "H": 3, "J": 4, "K": 5, "M": 6,
+                 "N": 7, "Q": 8, "U": 9, "V": 10, "X": 11, "Z": 12}
+    try:
+        month = month_map.get(name[-2])
+        year = 2020 + int(name[-1])
+        return datetime(year, month, 1)
+    except:
+        return datetime.min
 
 if __name__ == '__main__':
     signal.signal(signal.SIGINT, shutdown)
     signal.signal(signal.SIGTERM, shutdown)
 
-    try:
-        API_USER = os.environ['API_USER']
-        API_KEY  = os.environ['API_KEY']
-    except KeyError as e:
-        raise RuntimeError(f"Umgebungsvariable {e.args[0]} fehlt")
+    API_USER = os.environ.get("API_USER")
+    API_KEY = os.environ.get("API_KEY")
+    if not API_USER or not API_KEY:
+        raise RuntimeError("API_USER oder API_KEY fehlt in Umgebungsvariablen")
 
     api = ProjectXAPI(username=API_USER, api_key=API_KEY)
+    token = api.token
     
-    
-    #Print für NQ
-    print("→ Verfügbare MNQ-Kontrakte:")
-    contracts = api.search_contracts(search_text="MNQ")
-    for c in contracts:
-        print(c.get("id"), c.get("name"), c.get("description"))
 
-    #Print für GC
-    print("→ Verfügbare GC-Kontrakte:")
-    contracts = api.search_contracts(search_text="GC")
-    for c in contracts:
-        print(c.get("id"), c.get("name"), c.get("description"))
-    
-    #Print für YM
-    print("→ Verfügbare GC-Kontrakte:")
-    contracts = api.search_contracts(search_text="YM")
-    for c in contracts:
-        print(c.get("id"), c.get("name"), c.get("description"))
+    symbol_prefixes = ["MNQ", "MGC", "MYM"]
+    SYMBOL_NAMES = []
+    contract_id_to_name = {}
 
+    for prefix in symbol_prefixes:
+        contracts = api.search_contracts(search_text=prefix)
+        filtered = [c for c in contracts if c.get("name", "").startswith(prefix)]
+        if not filtered:
+            print(f"⚠️  Keine Kontrakte gefunden für {prefix}")
+            continue
 
+        sorted_contracts = sorted(filtered, key=lambda c: parse_expiry(c["name"]), reverse=True)
+        best = sorted_contracts[0]
 
+        name = best["name"]
+        uuid = best["id"]
+        SYMBOL_NAMES.append(name)
+        contract_id_to_name[uuid] = name
+
+        print(f"→ Ausgewählt: {name} | ID: {uuid} | DESC: {best.get('description')}")
+
+    if not SYMBOL_NAMES:
+        raise RuntimeError("Keine aktiven Symbole gefunden – Abbruch")
 
     accounts = api.get_active_accounts()
     if not accounts:
         raise RuntimeError("Kein aktives Konto gefunden")
 
     acct = accounts[0]
-    account_id = acct['id']
+    account_id = acct["id"]
     INITIAL_BALANCE = acct.get("balance", 0.0)
-    if account_id is None:
-        raise RuntimeError("API: Konto‐Informationen konnten nicht abgerufen werden")
 
-    SYMBOL_NAMES = ["MNQM5", "MGCQ5", "MYMM5"]
     SYMBOLS = []
     symbol_params = {}
-
-    # DataHandler EINMAL erzeugen
-    handler = DataHandler(api, account_id)
-    threading.Thread(target=handler.run, daemon=True).start()
+    contract_id_map = {}
 
     for symbol_name in SYMBOL_NAMES:
         contract = api.get_contract_by_name(symbol_name)
         contract_id = contract["id"]
-        SYMBOLS.append(contract_id)
+        SYMBOLS.append(symbol_name)
+        contract_id_map[symbol_name] = contract_id
+        contract_id_to_name[contract_id] = symbol_name
 
         tick_size = contract.get("tickSize")
         if tick_size is None or tick_size <= 0:
             raise RuntimeError(f"Ungültige Tick-Größe für {symbol_name}")
 
-        try:
-            quote_symbol = contract["name"]  # Symbol für Quote-Request
-            print(f"→ Versuche Quote für Symbol '{quote_symbol}' (Contract-ID: {contract_id}) zu laden")
-            quote = api.get_quote(contract_id=contract_id)
-            bid = quote.get("bid")
-            ask = quote.get("ask")
-            if bid is None or ask is None:
-                raise ValueError("Bid oder Ask fehlt")
-            spread = ask - bid
-        except Exception as e:
-            print(f"⚠️ Quote für {quote_symbol} konnte nicht geladen werden: {e}")
-            spread = 0
-
-        symbol_params[contract_id] = {
-            'tick_size': tick_size,
-            'spread': spread
+        spread = 0.5 * tick_size
+        symbol_params[symbol_name] = {
+            "tick_size": tick_size,
+            "spread": spread
         }
 
+    handler = DataHandler(
+        api=api,
+        account_id=account_id,
+        contract_id_to_name=contract_id_to_name  # ← genau das fehlt bisher
+    )
+    handler.strategies = {}  # neu: symbol → Strategy-Controller
 
-
-
-
-    # Strategien initialisieren
-    strategies: Dict[str, TradingStrategy] = {}
     for sym in SYMBOLS:
-        params = symbol_params[sym]
+        contract_id = contract_id_map[sym]
+        handler.fetch_history(contract_id, timeframe=15, limit=100)
+
+    strategies: Dict[str, TradingStrategy] = {}
+
+    for symbol in SYMBOLS:
+        params = symbol_params[symbol]
+        contract_id = contract_id_map[symbol]
+
         strat = TradingStrategy(
-            symbol=sym,
+            symbol=symbol,
             api=api,
             account_id=account_id,
             data_handler=handler,
             account_balance=INITIAL_BALANCE,
-            tick_size=params['tick_size'],
-            spread=params['spread']
+            tick_size=params["tick_size"],
+            spread=params["spread"],
+            contract_id=contract_id
         )
+
         strat.controller.initialize()
         strat.start()
-        strategies[sym] = strat
+        strategies[contract_id] = strat
 
-    # Periodische Summary
+        controller = strat.controller
+        handler.strategies[contract_id] = controller
+
+
+        handler.subscribe_candles(contract_id, 15, lambda c, ctl=controller: ctl.on_new_candle(contract_id, 15, Candle.from_dict(c)))
+        handler.subscribe_candles(contract_id, 180, lambda c, ctl=controller: ctl.on_new_candle(contract_id, 180, Candle.from_dict(c)))
+        handler.subscribe_candles(contract_id, 900, lambda c, ctl=controller: ctl.on_new_candle(contract_id, 900, Candle.from_dict(c)))
+
+
+
+
+
+
+
+    contract_ids = [strategy.contract_id for strategy in strategies.values()]
+    handler.start_ws(token, contract_ids)
+    handler.ws_client.on_new_candle = handler._on_15s_candle
+
+    user_client = UserWebSocketClient(token, account_id, handler.user_event)
     start_periodic_summary(strategies, interval=15)
 
-    # Start Event-Loop
-    t = threading.Thread(target=handler.run, daemon=True)
-    t.start()
-    
+
+    # Hauptloop
     try:
-        while True:
-            time.sleep(60)
+        handler.ws_client.run_forever()
     except KeyboardInterrupt:
-        print("Shutdown durch Benutzer")
+        shutdown(None, None)
+
