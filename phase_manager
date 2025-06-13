@@ -4,7 +4,7 @@ State Machine für Phasen-Übergänge. Liest PHASE_RULES aus config/phases.py un
 """
 from typing import List
 from config.phase import PHASE_RULES
-from core.types import PhaseRule, Phase, Candle, ContextStore
+from core.candles import PhaseRule, Phase, Candle, ContextStore
 
 
 
