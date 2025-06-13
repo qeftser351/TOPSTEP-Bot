@@ -3,11 +3,9 @@ from datetime import datetime, timedelta
 from typing import Dict, List, Callable, Optional
 from types import SimpleNamespace
 from typing import Any
-
 import pytz
 import pandas as pd
 from dateutil import parser
-
 from core.candles import Candle
 from config.timeframes import get_history_limit, TIMEFRAMES
 from projectx_api import ProjectXAPI
@@ -15,9 +13,10 @@ from ws_client_signalr import MarketWSClient
 from typing import Dict, List, Optional, Callable, Tuple
 from config.timeframes import aggregate_candles
 from candle_aggregator import CandleAggregator
-from core.candles import Candle
-from dateutil import parser
-from datetime import datetime
+import numpy as np
+
+
+
 
 
 
@@ -81,14 +80,23 @@ class DataHandler:
             "c": "close", "v": "volume"
         }, inplace=True)
 
-        df["timestamp"] = df["timestamp"].apply(lambda ts: (
-            datetime.utcfromtimestamp(ts / 1000) if isinstance(ts, (int, float))
-            else parser.isoparse(ts).replace(tzinfo=None)
-        ))
+        # ✅ Robuste Timestamp-Konvertierung (ms → UTC-naiv)
+        sample_ts = df["timestamp"].iloc[0]
+        if isinstance(sample_ts, (int, float, np.integer)):
+            unit = 's' if sample_ts < 1e10 else 'ms'
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True, unit=unit)
+        elif isinstance(sample_ts, str):
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        elif isinstance(sample_ts, (datetime, pd.Timestamp)):
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+        else:
+            raise TypeError(f"[fetch_history] Unsupported timestamp format: {type(sample_ts)} → {sample_ts}")
+
 
         # 🔁 Aggregation über zentrale Funktion
         candles_raw = df.to_dict(orient="records")
         aggregated = aggregate_candles(candles_raw, timeframe)
+
 
         candles = [Candle.from_dict(c) for c in aggregated]
 
@@ -111,66 +119,88 @@ class DataHandler:
     def start_ws(self, token: str, contract_ids: List[str]):
         from ws_client_signalr import MarketWSClient
 
-        # Aggregator für 15s-Candles
+        # ✅ Robuster Aggregator-Callback
+        def handle_15s_candle(contract_id, interval, candle):
+            if interval != 15:
+                return
+            if not isinstance(candle, Candle):
+                print(f"[ERROR] Ungültige Candle-Daten: type={type(candle)} value={candle}")
+                return
+            self._on_15s_candle(contract_id, interval, candle)
+
+
+        # ✅ Initialisiere Aggregator korrekt mit Callback
         self.quote_aggregator = CandleAggregator(
             interval_seconds=15,
-            on_new_candle=self._on_15s_candle  # wird direkt vom Aggregator aufgerufen
+            on_new_candle=handle_15s_candle
         )
 
-        # ✅ Registrierung in zentraler Dispatch-Logik für 15s
+        # ✅ Subscription für 15s-Dispatch (optional – wenn du _on_15s_candle direkt brauchst)
+        def make_handler(contract_id):
+            def handler(candle_dict):
+                candle = Candle.from_dict(candle_dict)
+                self._on_15s_candle(contract_id, 15, candle)
+            return handler
+
         for contract_id in contract_ids:
-            def handler(contract_id_inner, candle, tf=15, cid=contract_id):  # tf/cid defaulted to avoid late-binding issues
-                self._on_15s_candle(cid, tf, candle)
-            self.subscribe(contract_id, 15, handler)
+            self.subscribe(contract_id, 15, make_handler(contract_id))
 
-            
-        print(f"[INIT] contract_name_cache = {self.contract_name_cache}")
 
-        # WebSocket-Client initialisieren
+        # ✅ WebSocket-Client initialisieren
         self.ws_client = MarketWSClient(
             token=token,
             initial_symbols=contract_ids,
             quote_handler=self._handle_quote,
-            candle_handler=None,  # CandleSeries wird ignoriert
+            candle_handler=None,
             contract_id_to_name=self.contract_name_cache
         )
 
-        # WebSocket mit API verbinden
         self.api.attach_ws_client(self.ws_client)
-
-        # Verbindung starten
         self.ws_client.connect(contract_ids)
 
+
+
+
+
+
         
+
+
     def _handle_quote(self, contract_id: str, ts, bid: float, ask: float):
         original_ts = ts  # Für Debug-Zwecke
 
-        # 🔒 Timestamp-Konvertierung
-        if isinstance(ts, str):
-            try:
-                ts = parser.isoparse(ts).replace(tzinfo=None)
-            except Exception as e:
-                print(f"[ERROR] Timestamp-Parse-Fehler (str): {original_ts} → {e}")
-                return
-        elif isinstance(ts, (int, float)):
-            try:
-                # Nur gültige Unix-Zeiten zulassen
-                if ts < 0 or ts > 1e12:  # unrealistisch → vermutlich falsch
-                    print(f"[ERROR] Ungültiger Unix-Timestamp: {ts}")
-                    return
-                ts = datetime.utcfromtimestamp(ts)
-            except Exception as e:
-                print(f"[ERROR] Timestamp-Fehler (float/int): {original_ts} → {e}")
-                return
-        elif not isinstance(ts, datetime):
-            print(f"[ERROR] Ungültiger Timestamp-Typ: {original_ts} ({type(original_ts)})")
+        # 🔒 Timestamp-Konvertierung (robust, pandas-kompatibel, UTC-naiv)
+        try:
+            if isinstance(ts, (int, float, np.integer, np.floating)):
+                if ts < 0 or ts > 1e13:
+                    raise ValueError(f"Out-of-range Unix-Timestamp: {ts}")
+                unit = 's' if ts < 1e10 else 'ms'
+                ts = pd.to_datetime(ts, utc=True, unit=unit).to_pydatetime().replace(tzinfo=None)
+            elif isinstance(ts, str):
+                ts = pd.to_datetime(ts, utc=True).to_pydatetime().replace(tzinfo=None)
+            elif isinstance(ts, (datetime, pd.Timestamp)):
+                ts = pd.to_datetime(ts, utc=True).to_pydatetime().replace(tzinfo=None)
+            else:
+                raise TypeError(f"Unsupported timestamp type: {type(ts)}")
+        except Exception as e:
+            print(f"[ERROR] Failed to normalize timestamp: {original_ts} → {e}")
+            print(f"[DEBUG] Typ: {type(original_ts)} | Wert: {original_ts}")
             return
 
+        # ❌ Unvollständige Quote – abbrechen
+        if bid is None or ask is None:
+            print(f"[MarketWS][WARN] Unvollständige Quote: contract_id={contract_id} → bid={bid}, ask={ask}")
+            return
+
+        # ✅ Aggregator-Update
         if hasattr(self, "quote_aggregator"):
             try:
                 self.quote_aggregator.update(contract_id, bid, ask, ts)
             except Exception as e:
                 print(f"[ERROR] Aggregator-Update-Fehler: contract_id={contract_id}, ts={ts}, bid={bid}, ask={ask} → {e}")
+
+
+
 
 
 
