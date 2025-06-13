@@ -3,6 +3,7 @@ from core.tf_manager import MultiTimeframeController
 from core.phase_manager import Candle
 from projectx_api import ProjectXAPI
 from datetime import datetime, timedelta
+from config.timeframes import get_history_limit
 
 
 
@@ -15,7 +16,7 @@ def max_lots(api: ProjectXAPI, account_id: int, contract_id: str, risk_per_trade
     free_margin = details.get("freeMargin", details.get("balance", 0.0))
 
     # 2) Aktuellen Preis per Contract-ID holen
-    quote = api.get_quote(contract_id=contract_id)
+    quote = api.get_current_price(contract_id)
     if not quote:
         raise RuntimeError(f"API: Quote nicht verfügbar für Contract-ID {contract_id}")
     price = quote.get("ask") or quote.get("bid")
@@ -50,12 +51,14 @@ class TradingStrategy:
         account_id: int,
         account_balance: float,
         tick_size: float,
-        spread: float
+        spread: float,
+        contract_id: str  # <- neu
     ):
         self.symbol = symbol
         self.api = api
         self.account_id = account_id
         self.data_handler = data_handler
+        self.contract_id = contract_id  # <- speichert UUID
         self.contract_id_map = {}
 
         self.controller = MultiTimeframeController(
@@ -66,28 +69,16 @@ class TradingStrategy:
             tick_size=tick_size,
             spread=spread,
             data_handler=data_handler,
+            contract_id=contract_id  # <- gib UUID weiter
         )
 
 
     def start(self):
-        for tf in [K, B, E]:  # z.B. 900s, 180s, 15s
-            self.data_handler.subscribe_candles(
-                contract_id=self.symbol,
-                timeframe=tf,
-                callback=lambda c, tf=tf: self.controller.on_new_candle(tf, c)
-            )
+        # Initialzustand von FSM nach fetch_history (optional)
+        for tf in [K, B, E]:
+            candles = self.data_handler.fetch_history(self.contract_id, tf, get_history_limit(tf))
+            self.controller.history[tf] = candles[:-1]
+            self.controller.machines[tf].reset()
+            self.controller.machines[tf].context['last_candles'] = candles[:-1]
+            self.controller.phases[tf] = self.controller.machines[tf].replay_from_scratch(candles[:-1])
 
-
-
-    def _on_candle(self, timeframe: int, raw_candle) -> None:
-        # Angenommen, raw_candle ist jetzt ein Dict:
-        # { "timestamp": 1630000000000, "open": ..., "high": ..., "low": ..., "close": ..., "volume": ... }
-        c = Candle(
-            timestamp=datetime.utcfromtimestamp(raw_candle["timestamp"] / 1000),
-            open=raw_candle["open"],
-            high=raw_candle["high"],
-            low=raw_candle["low"],
-            close=raw_candle["close"],
-            volume=raw_candle["volume"]
-        )
-        self.controller.on_new_candle(timeframe, c)
