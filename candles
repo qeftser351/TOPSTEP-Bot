@@ -4,6 +4,8 @@ from datetime import datetime
 from datetime import timezone
 from dateutil import parser
 import pandas as pd
+import numpy as np
+
 
 # --------------------------------------------
 # Candle‑Definition (API-Ready)
@@ -71,35 +73,32 @@ class Candle:
     
     @staticmethod
     def from_dict(d: dict) -> "Candle":
-        # Erkenne Zeitstempel-Feld: entweder 't' (API) oder 'timestamp' (lokale Aggregation)
+        # Timestamp-Feld identifizieren
         if "t" in d:
-            ts = datetime.utcfromtimestamp(d["t"] / 1000)
-            o, h, l, c, v = d["o"], d["h"], d["l"], d["c"], d["v"]
+            ts = d["t"]
         elif "timestamp" in d:
             ts = d["timestamp"]
-
-            if isinstance(ts, str):
-                ts = parser.isoparse(ts)
-            elif isinstance(ts, (int, float)):
-                if ts > 1e12:
-                    ts = datetime.utcfromtimestamp(ts / 1000)  # ms
-                else:
-                    ts = datetime.utcfromtimestamp(ts)
-            elif not isinstance(ts, (datetime, pd.Timestamp)):
-                raise ValueError(f"Ungültiger Timestamp: {ts}")
-
-            ts = pd.Timestamp(ts)
-            o, h, l, c, v = d["open"], d["high"], d["low"], d["close"], d["volume"]
         else:
             raise ValueError("Unbekanntes Candle-Format – weder 't' noch 'timestamp' gefunden")
 
+        # ✅ Robuste Timestamp-Konvertierung
+        if isinstance(ts, (int, float, np.integer)):
+            unit = 'ms' if ts > 1e12 else 's'
+            ts = pd.to_datetime(ts, unit=unit, utc=True).tz_convert(None)
+        elif isinstance(ts, str):
+            ts = pd.to_datetime(ts, utc=True).tz_convert(None)
+        elif isinstance(ts, (datetime, pd.Timestamp)):
+            ts = pd.to_datetime(ts, utc=True).tz_convert(None)
+        else:
+            raise TypeError(f"[from_dict] Unsupported timestamp type: {type(ts)} → {ts}")
+
         return Candle(
             timestamp=ts,
-            open=o,
-            high=h,
-            low=l,
-            close=c,
-            volume=v,
+            open=d.get("o") or d.get("open"),
+            high=d.get("h") or d.get("high"),
+            low=d.get("l") or d.get("low"),
+            close=d.get("c") or d.get("close"),
+            volume=d.get("v") or d.get("volume"),
             open_bid=d.get("open_bid"),
             high_bid=d.get("high_bid"),
             low_bid=d.get("low_bid"),
@@ -114,15 +113,26 @@ class Candle:
 
 
 
+
 def dicts_to_candles(dict_list: List[Dict[str, Any]]) -> List[Candle]:
     """
     Wandelt eine Liste von Candle-Dicts aus der API/Aggregation in Candle-Objekte um.
-    Erwartet timestamp in ms.
-    Bid/Ask-Felder optional, default None.
+    Erwartet timestamp in ms. Bid/Ask-Felder optional, default None.
     """
-    return [
-        Candle(
-            timestamp=datetime.utcfromtimestamp(item['timestamp'] / 1000),
+    candles = []
+    for item in dict_list:
+        raw_ts = item.get("timestamp")
+        if isinstance(raw_ts, (int, float, np.integer)):
+            ts = pd.to_datetime(int(raw_ts), unit='ms', utc=True).tz_convert(None)
+        elif isinstance(raw_ts, str):
+            ts = pd.to_datetime(raw_ts, utc=True).tz_convert(None)
+        elif isinstance(raw_ts, (datetime, pd.Timestamp)):
+            ts = pd.to_datetime(raw_ts, utc=True).tz_convert(None)
+        else:
+            raise TypeError(f"[dicts_to_candles] Unsupported timestamp type: {type(raw_ts)} → {raw_ts}")
+
+        candles.append(Candle(
+            timestamp=ts,
             open=item['open'],
             high=item['high'],
             low=item['low'],
@@ -136,9 +146,10 @@ def dicts_to_candles(dict_list: List[Dict[str, Any]]) -> List[Candle]:
             high_ask=item.get('high_ask'),
             low_ask=item.get('low_ask'),
             close_ask=item.get('close_ask'),
-        )
-        for item in dict_list
-    ]
+        ))
+
+    return candles
+
 
 
 # --------------------------------------------
