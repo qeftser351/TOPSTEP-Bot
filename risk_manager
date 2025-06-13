@@ -1,6 +1,6 @@
 import math
 from typing import List, Optional, Dict
-from core.types import Candle
+from core.candles import Candle
 import time
 from projectx_api import ProjectXAPI
 
@@ -122,7 +122,7 @@ class RiskManager:
         contract_id = contract["id"]
 
         # 2. Quote per contract_id holen
-        quote = self.api.get_quote(contract_id)
+        quote = self.api.get_current_price(contract_id)
 
         # Rest deiner Logik hier ...
         bid = quote.get("bid")
@@ -199,7 +199,7 @@ class RiskManager:
         contract_id = contract["id"]
 
         # 2. Quote per contract_id holen
-        quote = self.api.get_quote(contract_id)
+        quote = self.api.get_current_price(contract_id)
 
         go_candle = None
         go_index = -1
@@ -324,7 +324,7 @@ class RiskManager:
         contract_id = contract["id"]
 
         # Quote per Contract-ID abrufen
-        quote = self.api.get_quote(contract_id)
+        quote = self.api.get_current_price(contract_id)
         price_ref = quote.get("bid") if side == "buy" else quote.get("ask")
 
         # 5) Clamp ↔ min_dist prüfen
@@ -402,7 +402,7 @@ class RiskManager:
         contract_id = contract["id"]
 
         # Quote per Contract-ID abrufen
-        quote = self.api.get_quote(contract_id)
+        quote = self.api.get_current_price(contract_id)
         price_ref = quote.get("bid") if side == "buy" else quote.get("ask")
 
         # Clamp: Nie näher als min_dist zum aktuellen Preis
