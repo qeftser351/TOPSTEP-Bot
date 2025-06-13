@@ -1,0 +1,258 @@
+import time
+from signalrcore.hub_connection_builder import HubConnectionBuilder
+from typing import Callable, Dict, List, Optional
+from dateutil import parser
+import pandas as pd
+from core.candles import Candle
+from datetime import datetime, timezone
+from dateutil import parser
+
+
+
+class MarketWSClient:
+    def __init__(
+        self,
+        token: str,
+        initial_symbols: List[str],
+        quote_handler: Callable[[str, datetime, float, float], None],
+        candle_handler: Callable[[str, int, dict], None],
+        contract_id_to_name: Optional[Dict[str, str]] = None,
+        on_new_candle: Optional[Callable[[str, int, Candle], None]] = None
+    ):
+        self.token = token
+        self.contract_ids = initial_symbols
+        self.quote_handler = quote_handler
+        self.on_candle = candle_handler
+        self.contract_id_to_name = contract_id_to_name or {}
+        self.latest_quotes = {}
+        self.on_new_candle = on_new_candle
+        self.name_to_contract_id = {v: k for k, v in self.contract_id_to_name.items()}
+        
+        self._quote_buffers = {}
+        self.tf_manager = None
+
+        self.hub_url = f"wss://rtc.topstepx.com/hubs/market?access_token={token}"
+        self.hub_connection = HubConnectionBuilder()\
+            .with_url(self.hub_url)\
+            .with_automatic_reconnect({
+                "type": "raw",
+                "keep_alive_interval": 10,
+                "reconnect_interval": 5,
+                "max_attempts": 5
+            })\
+            .build()
+
+        self.hub_connection.on("GatewayQuote", self._on_quote_event)
+        self.hub_connection.on_open(self.on_open)
+        self.hub_connection.on_close(self.on_close)
+        self.hub_connection.on_error(self.on_error)
+        
+        print(f"[MarketWS][INIT] quote_handler gesetzt: {self.quote_handler is not None}")
+
+    def on_open(self):
+        print("[MarketWS] Verbindung geöffnet")
+        self.subscribe_quotes(self.contract_ids)
+        
+
+        
+    def _on_quote_event(self, args):
+        if not args or len(args) != 2:
+            print(f"[MarketWS][ERROR] Ungültige Quote-Event-Args: {args}")
+            return
+
+        contract_id, data = args
+        bid = data.get("bestBid")
+        ask = data.get("bestAsk")
+        ts_str = data.get("timestamp")
+
+        if bid is None or ask is None or not ts_str:
+            print(f"[MarketWS][WARN] Inkomplette Quote – {contract_id=} {data=}")
+            return
+
+        try:
+            ts = parser.isoparse(ts_str).astimezone(timezone.utc).replace(tzinfo=None)
+        except Exception as e:
+            print(f"[MarketWS][ERROR] Ungültiger Timestamp: {ts_str} – {e}")
+            return
+
+        self.latest_quotes[contract_id] = {"bid": bid, "ask": ask, "timestamp": ts}
+
+        if self.quote_handler:
+            try:
+                candle_dict = {
+                    "timestamp": ts,
+                    "open": bid,
+                    "high": bid,
+                    "low": bid,
+                    "close": bid,
+                    "volume": 1,
+                    "open_bid": bid,
+                    "high_bid": bid,
+                    "low_bid": bid,
+                    "close_bid": bid,
+                    "open_ask": ask,
+                    "high_ask": ask,
+                    "low_ask": ask,
+                    "close_ask": ask,
+                }
+                candle = Candle(**candle_dict)
+                self.quote_handler(contract_id, ts, bid, ask)
+            except Exception as e:
+                print(f"[MarketWS][ERROR] Quote-Handler Exception: {e}")
+
+
+    def _on_quote(self, contract_id: str, data: dict):
+        bid = data.get("bestBid")
+        ask = data.get("bestAsk")
+        timestamp_iso = data.get("timestamp")
+
+        if not timestamp_iso:
+            print(f"[MarketWS][WARN] Ungültiger Timestamp: {data}")
+            return
+
+        try:
+            ts = pd.to_datetime(timestamp_iso)
+        except Exception as e:
+            print(f"[MarketWS][ERROR] Ungültiger Timestamp {timestamp_iso}: {e}")
+            return
+
+        symbol = self.contract_id_to_name.get(contract_id, contract_id)
+
+        # 🔁 Quote-Heilung per Cache
+        if not hasattr(self, "last_bid"):
+            self.last_bid = {}
+            self.last_ask = {}
+
+        if bid is None:
+            bid = self.last_bid.get(symbol)
+        else:
+            self.last_bid[symbol] = bid
+
+        if ask is None:
+            ask = self.last_ask.get(symbol)
+        else:
+            self.last_ask[symbol] = ask
+
+        if bid is None or ask is None:
+            print(f"[MarketWS][WARN] Kein gültiger Bid/Ask für {symbol} → {data}")
+            return
+
+        self._quote_to_candle(symbol, ts, bid, ask)
+
+        
+    def _quote_to_candle(self, symbol: str, ts, bid: float, ask: float):
+        # 🔒 Timestamp-Konvertierung
+        if isinstance(ts, str):
+            ts = parser.isoparse(ts).replace(tzinfo=None)
+        elif isinstance(ts, (int, float)):
+            ts = datetime.utcfromtimestamp(ts)
+        if not isinstance(ts, pd.Timestamp):
+            ts = pd.Timestamp(ts)
+        if ts.tzinfo is not None:
+            ts = ts.tz_convert(None)
+
+        price = bid  # oder (bid + ask) / 2
+        interval = ts.floor("15s")
+
+        buf = self._quote_buffers.setdefault(symbol, {
+            "current_candle": None,
+            "last_interval": None,
+        })
+
+        if buf["last_interval"] != interval:
+            if isinstance(buf["current_candle"], Candle):
+                contract_id = self.name_to_contract_id.get(symbol)
+                if not contract_id:
+                    print(f"[ERROR] Kein contract_id für Symbol {symbol}")
+                    return
+                self._on_new_15s_candle(contract_id, 15, buf["current_candle"])
+
+
+            buf["current_candle"] = Candle(
+                timestamp=interval.to_pydatetime(),
+                open=price,
+                high=price,
+                low=price,
+                close=price,
+                volume=1
+            )
+            buf["last_interval"] = interval
+        else:
+            c = buf["current_candle"]
+            if not isinstance(c, Candle):
+                print(f"[ERROR] Expected Candle, got {type(c)}: {c}")
+                return
+            c.high = max(c.high, price)
+            c.low = min(c.low, price)
+            c.close = price
+            c.volume += 1
+
+
+
+
+
+    def _on_new_15s_candle(self, symbol: str, candle):
+        if isinstance(candle, dict):
+            candle = Candle.from_dict(candle)
+        elif not isinstance(candle, Candle):
+            print(f"[ERROR] Ungültiger Candle-Typ: {type(candle)} → {candle}")
+            return
+
+        print(f"[15s-Candle] {symbol} @ {candle.timestamp} | O={candle.open} H={candle.high} L={candle.low} C={candle.close}")
+
+        if self.on_new_candle:
+            print(f"[DISPATCH] Trigger → {symbol} | on_new_candle vorhanden")
+            self.on_new_candle(symbol, 15, candle)
+        else:
+            print(f"[MarketWS] ⚠ Kein on_new_candle-Handler gesetzt für {symbol}")
+
+
+
+
+
+
+
+    def subscribe_quotes(self, contract_ids: List[str]):
+        for cid in contract_ids:
+            msg = {
+                "type": 1,
+                "target": "SubscribeContractQuotes",
+                "arguments": [cid]
+            }
+            self.hub_connection.send("SubscribeContractQuotes", [cid])
+            print(f"[MarketWS] send subscribe → {msg}")
+
+    def on_close(self):
+        print("[MarketWS] Connection closed")
+
+    def on_error(self, error):
+        from signalrcore.messages.completion_message import CompletionMessage
+        if isinstance(error, CompletionMessage):
+            print("[MarketWS][ERROR CompletionMessage]:", error.error)
+        else:
+            print("[MarketWS][ERROR]:", error)
+
+    def _wrap_debug(self, func):
+        def wrapper(*args, **kwargs):
+            import json
+            print("[MarketWS][DEBUG] Message empfangen in _wrap_debug()")
+            try:
+                print("[MarketWS][RECV][RAW]:", json.dumps(args[0], indent=2))
+            except Exception:
+                print("[MarketWS][RECV][RAW]:", args)
+            return func(*args, **kwargs)
+        return wrapper
+
+    def connect(self, contract_ids: List[str]):
+        self.contract_ids = contract_ids
+        self.hub_connection.start()
+
+    def run_forever(self):
+        try:
+            while True:
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop()
+
+    def stop(self):
+        self.hub_connection.stop()
