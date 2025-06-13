@@ -7,12 +7,20 @@ from typing import Optional, List, Dict
 import json
 from datetime import datetime, timedelta
 import pandas as pd
+from ws_client_signalr import MarketWSClient 
+from typing import Optional
+
+# Typisierung vermeiden harte Abhängigkeiten
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from ws_client_signalr import MarketWSClient
 
 
 load_dotenv()  # Umgebungsvariablen (API_USER/API_KEY) laden
 
 class ProjectXAPI:
     def __init__(self, username, api_key):
+        print("[DEBUG] ProjectXAPI geladen aus:", __file__)
         self.base_url = os.getenv("API_BASE_URL", "https://api.topstepx.com")
         self.username = username
         self.api_key = api_key
@@ -20,11 +28,18 @@ class ProjectXAPI:
         self.token_timestamp = 0
         self.token_lifetime = 60 * 60 * 23  # 23 Stunden, konservativ
         self.session = requests.Session()
+        self._last_api_call_time = 0
+        self.ws_client = None
 
-        self.authenticate()  # Initial holen
+        self._retry_authenticate_with_backoff()
+
+    def attach_ws_client(self, ws_client):
+        self.ws_client = ws_client
 
     def _auth_header(self) -> dict:
         return {"Authorization": f"Bearer {self.token}"}
+    
+
 
 
     def authenticate(self):
@@ -50,6 +65,12 @@ class ProjectXAPI:
             raise Exception(f"Authentication failed (errorCode={ec})")
         self.token = data["token"]
         self.token_timestamp = time.time()
+        
+        # Header zentral für alle folgenden Requests setzen
+        self.session.headers.update({
+            "Authorization": f"Bearer {self.token}",
+            "Content-Type": "application/json"
+        })
 
     # Simple Zeitprüfung, Option: Validierung über API
     def token_is_valid(self):
@@ -60,32 +81,32 @@ class ProjectXAPI:
         @functools.wraps(func)
         def wrapper(self, *args, **kwargs):
             max_retries = 3
-            delay = 1
+            base_delay = 1.0
+            min_interval = 1.0  # Minimum Abstand zwischen API-Requests (sek.)
 
-            min_interval = 0.3  # z.B. 300 ms minimaler Abstand, experimentell anpassen
             now = time.time()
-            if hasattr(self, '_last_api_call_time'):
-                elapsed = now - self._last_api_call_time
-                if elapsed < min_interval:
-                    wait = min_interval - elapsed
-                    print(f"[RATE LIMIT] Warte {wait:.2f}s vor nächstem API-Call")
-                    time.sleep(wait)
+            elapsed = now - self._last_api_call_time
+            if elapsed < min_interval:
+                time.sleep(min_interval - elapsed)
 
             for attempt in range(max_retries):
                 try:
                     if not self.token_is_valid() or not self.validate_session():
                         self.authenticate()
-                    result = func(self, *args, **kwargs)
-                    self._last_api_call_time = time.time()  # Zeitstempel aktualisieren
-                    return result
-                except requests.exceptions.HTTPError as e:
-                    if e.response is not None and e.response.status_code == 503:
-                        print(f"[WARN] 503 Service Unavailable, Retry {attempt+1}/{max_retries} in {delay}s...")
+
+                    response = func(self, *args, **kwargs)
+                    self._last_api_call_time = time.time()
+                    return response
+
+                except requests.exceptions.RequestException as e:
+                    is_503 = isinstance(e, requests.exceptions.HTTPError) and e.response.status_code == 503
+                    if attempt < max_retries - 1 and (is_503 or isinstance(e, (requests.exceptions.Timeout, requests.exceptions.ConnectionError))):
+                        delay = base_delay * (2 ** attempt)  # Exponentielles Backoff
+                        print(f"[WARN] API-Fehler ({e}), Retry {attempt + 1}/{max_retries} in {delay:.1f}s")
                         time.sleep(delay)
-                        delay *= 2
                         continue
                     raise
-            raise RuntimeError(f"API 503 Service Unavailable nach {max_retries} Versuchen")
+            raise RuntimeError(f"API-Request fehlgeschlagen nach {max_retries} Versuchen")
         return wrapper
 
 
@@ -98,6 +119,20 @@ class ProjectXAPI:
         response.raise_for_status()
         data = response.json()
         return data.get("success", False)
+    
+    def _retry_authenticate_with_backoff(self, retries=3, base_delay=1.0):
+        for attempt in range(retries):
+            try:
+                self.authenticate()
+                return  # Erfolg → raus
+            except requests.exceptions.RequestException as e:
+                if attempt < retries - 1:
+                    delay = base_delay * (2 ** attempt)
+                    print(f"[WARN] Authentifizierung fehlgeschlagen (Versuch {attempt+1}/{retries}): {e}. Warte {delay:.1f}s...")
+                    time.sleep(delay)
+                else:
+                    raise RuntimeError(f"Login fehlgeschlagen nach {retries} Versuchen: {e}")
+
 
         
     #Welche Konten gibt es
@@ -186,79 +221,39 @@ class ProjectXAPI:
             "Content-Type": "application/json"
         }
 
+        if not end_time:
+            end_time = datetime.utcnow()
+
+        if not start_time:
+            # Dynamisch sinnvolle Zeitspanne setzen, abhängig von unit_number
+            if unit == 1 and unit_number == 15:
+                start_time = end_time - timedelta(minutes=5)  # max. 20 Bars ≈ stabil
+            elif unit == 1 and unit_number == 180:
+                start_time = end_time - timedelta(hours=1.5)
+            elif unit == 1 and unit_number == 900:
+                start_time = end_time - timedelta(hours=12)
+            else:
+                start_time = end_time - timedelta(days=5)  # Fallback für Minutenkerzen oder Tests
+
         payload = {
             "contractId": contract_id,
-            "unit": unit,
+         "unit": unit,
             "unitNumber": unit_number,
+            "startTime": start_time.isoformat() + "Z",
+            "endTime": end_time.isoformat() + "Z",
             "limit": limit,
             "live": live,
             "includePartialBar": include_partial_bar
         }
 
-        # Nur bei historischen Abfragen ein Zeitfenster setzen
-        if not live:
-            if end_time is None:
-                end_time = datetime.utcnow()
-            if start_time is None:
-                start_time = end_time - timedelta(days=5)
-
-            payload["startTime"] = start_time.isoformat() + "Z"
-            payload["endTime"] = end_time.isoformat() + "Z"
+        print("[DEBUG] Sende Candle-Request an ProjectX:")
+        print("URL:", url)
+        print("Payload:", json.dumps(payload, indent=2))
 
         response = self.session.post(url, json=payload, headers=headers)
         response.raise_for_status()
+
         return response.json().get("bars", [])
-
-
-
-
-
-
-
-
-    #"Live"-Kerzen abholen
-    @ensure_token
-    def get_latest_candle(
-        self,
-        contract_id: str,
-        unit: int,
-        unit_number: int,
-    ) -> Optional[dict]:
-        now = datetime.utcnow()
-        start_time = now - timedelta(seconds=unit * unit_number * 2)
-
-        bars = self.get_candles(
-            contract_id=contract_id,
-            unit=unit,
-            unit_number=unit_number,
-            limit=10,  # Mehr als 1, damit mehrere Bars für Sortierung vorliegen
-            live=False,
-            start_time=start_time,
-            end_time=now,
-            include_partial_bar=True
-        )
-    
-        print(f"[LIVE DEBUG] Raw Bars von API ({contract_id}): {bars}")
-
-        if not bars:
-            return None
-
-        # Sortiere Bars nach Zeitstempel aufsteigend
-        bars_sorted = sorted(bars, key=lambda x: x["t"])
-
-        # Nehme die Bar mit dem neuesten Zeitstempel (kann Partial Bar sein)
-        bar = bars_sorted[-1]
-
-        return {
-            "timestamp": pd.to_datetime(bar["t"], utc=True).to_pydatetime().replace(tzinfo=None),
-            "open": bar["o"],
-            "high": bar["h"],
-            "low":  bar["l"],
-            "close": bar["c"],
-            "volume": bar["v"]
-        }
-
-
 
 
 
@@ -296,24 +291,10 @@ class ProjectXAPI:
 
     @ensure_token
     def get_current_price(self, contract_id: str) -> dict:
-        """
-        Liefert den aktuellen Marktpreis (Bid, Ask) über Contract Details oder Latest Candle.
-        """
-        contract = self.get_contract_details_by_id(contract_id)
-        bid = contract.get("bid")
-        ask = contract.get("ask")
-    
-        # Falls nicht vorhanden, versuche den letzten Candle-Preis als Fallback
-        if bid is None or ask is None:
-            candle = self.get_latest_candle(contract_id, unit=1, unit_number=1)
-            if candle is not None:
-             # Nutze Close als Ersatz
-                bid = candle["close"]
-                ask = candle["close"]
-            else:
-                raise RuntimeError(f"Keine Preisinformationen für Contract {contract_id} verfügbar")
+        if self.ws_client and contract_id in self.ws_client.latest_quotes:
+            return self.ws_client.latest_quotes[contract_id]
+        return {}
 
-        return {"bid": bid, "ask": ask}
 
 
 
@@ -414,15 +395,6 @@ class ProjectXAPI:
     def get_contract(self, contract_id: str) -> dict:
         return self.get_contract_by_name(contract_id)
 
-
-    @ensure_token
-    def get_quote_by_symbol(self, symbol_name: str) -> dict:
-        url = f"{self.base_url}/api/Quote/{symbol_name}"
-        headers = self._auth_header()
-        response = self.session.get(url, headers=headers)
-        response.raise_for_status()
-        return response.json()
-
     
 
     @ensure_token
@@ -430,63 +402,14 @@ class ProjectXAPI:
         url = f"{self.base_url}/api/Contract/searchById"
         headers = self._auth_header()
         payload = {"contractId": contract_id}
-
-        print(f"→ GET CONTRACT DETAILS via /searchById mit contractId: {contract_id}")
-        print("→ Payload:", payload)
-
         response = self.session.post(url, json=payload, headers=headers)
-
-        # Debug-Ausgabe Roh-Antwort
-        print(f"→ Response Status: {response.status_code}")
-        print(f"→ Response Body: {response.text}")
-
         response.raise_for_status()
         data = response.json()
-        contract = data.get("contract")
+        contract = data.get("contract") or (data.get("contracts")[0] if data.get("contracts") else None)
         if contract:
             return contract
         raise RuntimeError("No contract found in response.")
 
-
-
-    @ensure_token
-    def get_quote(self, contract_id: str) -> dict:
-        url = f"{self.base_url}/api/Quote"
-        headers = self._auth_header()
-        headers["Content-Type"] = "application/json"
-        payload = {"contractId": contract_id}
-    
-        print(f"[DEBUG] API-Aufruf get_quote mit contract_id: {contract_id}")
-        print(f"[DEBUG] URL: {url}")
-        print(f"[DEBUG] Payload: {payload}")
-    
-        response = self.session.post(url, json=payload, headers=headers)
-        print(f"[DEBUG] Response Status: {response.status_code}")
-        print(f"[DEBUG] Response Text: {response.text}")
-    
-        if response.status_code == 404:
-            print(f"[WARN] Quote für Contract-ID {contract_id} nicht gefunden, versuche Fallback mit get_latest_candle()")
-            candle = self.get_latest_candle(contract_id, unit=1, unit_number=1)
-            if candle:
-                print(f"[DEBUG] Fallback Candle gefunden: close={candle['close']}")
-                return {"bid": candle["close"], "ask": candle["close"]}
-            else:
-                print(f"[ERROR] Kein Fallback Candle für Contract-ID {contract_id} verfügbar")
-                response.raise_for_status()
-    
-        response.raise_for_status()
-        data = response.json()
-        print(f"[DEBUG] Quote-Daten: {data}")
-    
-        bid = data.get("bid")
-        ask = data.get("ask")
-        if bid is None or ask is None:
-            print(f"[WARN] Bid oder Ask fehlt in Quote-Daten für Contract-ID {contract_id}")
-    
-        return {
-            "bid": bid,
-            "ask": ask
-        }
 
 
         
@@ -571,6 +494,9 @@ class ProjectXAPI:
         data = response.json()
         return data.get("success", False)
 
+    def __getattr__(self, name):
+        print(f"[CRITICAL] Jemand ruft {name} auf, das existiert nicht in ProjectXAPI!")
+        raise AttributeError(f"'ProjectXAPI' object has no attribute '{name}'")
 
 
 
